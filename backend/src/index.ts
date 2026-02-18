@@ -1,4 +1,7 @@
 import "dotenv/config";
+import path from "path";
+import { existsSync } from "fs";
+import { fileURLToPath } from "url";
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -32,6 +35,17 @@ app.use("/api/history", historyRouter);
 app.use("/api/stats", statsRouter);
 
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
+
+// Serve frontend in production
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const frontendDir = path.join(__dirname, "..", "public");
+if (process.env.NODE_ENV === "production" && existsSync(frontendDir)) {
+  app.use(express.static(frontendDir));
+  app.get("*", (req, res, next) => {
+    if (req.path.startsWith("/api")) return next();
+    res.sendFile(path.join(frontendDir, "index.html"));
+  });
+}
 
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   logger.error("Unhandled error", err);

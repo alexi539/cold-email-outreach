@@ -110,6 +110,8 @@ export const history = {
     const q = new URLSearchParams(params as Record<string, string>).toString();
     return fetchApi<SentEmail[]>(`/history${q ? `?${q}` : ""}`);
   },
+  refreshReply: (id: string) =>
+    fetchApi<{ updated: boolean; error?: string }>(`/history/${id}/refresh-reply`, { method: "POST" }),
 };
 
 export const stats = {

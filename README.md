@@ -103,6 +103,24 @@ Optional: validate emails before upload to reduce bounce rate. Uses [ValidKit](h
 4. **When adding NEW keys** (beyond the initial set) with a different billing cycle, **you MUST ask the user for their reset day** and add it to `VALIDKIT_RESET_DAYS`. See `backend/src/services/validkit.ts` for details.
 5. **Validation backups:** After each validation run, results are saved to `backend/validated-backups/` as JSON files (e.g. `validated-2025-02-17T14-30-45.json`). This preserves ValidKit tokens — if upload fails, you can reuse the backup without re-validating. Backups are not stored in the database.
 
+### Reply Check (optional)
+
+- `REPLY_CHECK_GMAIL_LIMIT` — max sent emails to check per account per run (default 150). Lower if hitting Gmail API rate limits.
+
+### Deploy to Railway (GitHub + production)
+
+1. **Push to GitHub:** Create a repo and push the code.
+2. **Railway:** Sign up at [railway.app](https://railway.app), create a new project.
+3. **Deploy from GitHub:** In Railway, click "Deploy from GitHub repo" and connect your repository. Railway auto-detects the build (`npm run build`) and start (`npm run start`) from root `package.json`.
+4. **Environment variables:** In Railway project → Variables, add:
+   - `DATABASE_URL` — use Railway's SQLite or add PostgreSQL plugin for production
+   - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `ENCRYPTION_KEY`
+   - `FRONTEND_URL` — your Railway app URL (e.g. `https://your-app.up.railway.app`)
+5. **Google OAuth:** Add your Railway URL to Google Cloud Console redirect URIs: `https://your-app.up.railway.app/auth/callback`
+6. **GitHub Actions (optional):** For deploy on push, add `RAILWAY_TOKEN` (from Railway → Settings → Tokens) to GitHub repo secrets. The workflow in `.github/workflows/deploy.yml` will deploy on push to `main`/`master`.
+
+**Note:** In production, backend serves the frontend from a single URL. SQLite on Railway uses ephemeral storage unless you add a Volume — consider PostgreSQL for persistent data.
+
 ---
 
 ## 4. File Structure
@@ -128,7 +146,7 @@ Optional: validate emails before upload to reduce bounce rate. Uses [ValidKit](h
 │   │   │   ├── accounts.ts
 │   │   │   ├── validateCampaign.ts
 │   │   │   ├── replyType.ts      # Bounce/auto-reply detection
-│   │   │   └── gmailBody.ts      # Gmail message body extraction
+│   │   │   └── gmailBody.ts      # Gmail body extraction (recursive multipart, attachmentId, charset)
 │   │   ├── routes/
 │   │   │   ├── accounts.ts
 │   │   │   ├── auth.ts
@@ -142,7 +160,7 @@ Optional: validate emails before upload to reduce bounce rate. Uses [ValidKit](h
 │   │       ├── validkit.ts      # Multi-key email validation (ValidKit API)
 │   │       ├── personalize.ts
 │   │       ├── scheduler.ts
-│   │       ├── replyChecker.ts
+│   │       ├── replyChecker.ts  # Gmail/Zoho reply detection, re-check empty body, batch limit
 │   │       ├── campaignStart.ts
 │   │       └── campaignCompletion.ts
 │   ├── validated-backups/       # JSON backups of ValidKit validation results (created on first validation)
@@ -164,6 +182,7 @@ Optional: validate emails before upload to reduce bounce rate. Uses [ValidKit](h
     │       ├── Campaigns.tsx
     │       ├── CampaignEdit.tsx
     │       ├── History.tsx
+    │       ├── Replies.tsx
     │       └── AuthCallback.tsx
     ├── index.html
     ├── vite.config.ts
@@ -242,7 +261,7 @@ Optional: validate emails before upload to reduce bounce rate. Uses [ValidKit](h
 - **Dashboard** — stats, campaign list
 - **Email Accounts** — Gmail (OAuth) and Zoho
 - **Campaigns** — create, list, edit
-- **Replies** — all replies (human, bounce, auto-reply) with full text; filter by campaign and type; expand to read reply body
+- **Replies** — all replies (human, bounce, auto-reply) with full text; filter by campaign and type; expand to read reply body; Expand/Collapse for long replies; "Body not extracted" + Refresh button when body missing
 - **History** — all sent emails with status
 
 ### Campaign Edit — Tabs
@@ -293,7 +312,7 @@ Optional: validate emails before upload to reduce bounce rate. Uses [ValidKit](h
 - **Follow-up threading (Zoho):** Follow-ups use In-Reply-To and References headers so they appear as replies in the same thread
 - **Edit sequence during run:** New content applies to unsent emails. Already-sent emails keep their content and status.
 - **Remove follow-up:** Only the last follow-up can be removed (must remove in order)
-- **Reply detection:** Every 3 min (cron `*/3 * * * *`). Gmail via threadId (format: full), Zoho via IMAP. Stores reply body, replyAt, replyType.
+- **Reply detection:** Every 3 min (cron `*/3 * * * *`). Gmail via threadId (format: full), Zoho via IMAP. Stores reply body, replyAt, replyType. **Re-check:** replied/bounce/auto_reply with empty replyBody are re-processed to backfill body. **Gmail:** recursive multipart extraction, attachmentId fetch when body.data null, charset from Content-Type; messages sorted by internalDate; batch limit 150 (env `REPLY_CHECK_GMAIL_LIMIT`), 100 ms delay between requests; lock prevents concurrent runs. **Zoho:** INBOX + Junk + Spam folders; last 500 emails; recursive multipart in body extraction; charset support.
 - **Bounce/auto-reply detection:** Replies are classified as **human**, **bounce** (delivery failed, user unknown, etc.), or **auto_reply** (out of office, vacation, etc.). Fast replies (&lt; 5 min) without clear human content → auto_reply. Bounce/auto_reply leads stop receiving follow-ups.
 - **Pause:** Manual or auto when campaign/account limits reached
 - **Paused campaign protection:** Paused campaigns are never auto-changed to "finished". Only **active** campaigns auto-finish when all leads are done. You control when to resume or finish a paused campaign.
@@ -364,6 +383,9 @@ All backend logs go to **stdout** (console). When running `npm run dev`, logs ap
 | Send failed | `Send failed` | leadId, to, accountId, campaignId, step, message, stack |
 | Scheduler crash | `Scheduler error` | message, stack |
 | Reply detected | `Reply detected` | leadId, replyType, campaignId |
+| Reply body backfilled | `Reply body backfilled` | sentEmailId |
+| Reply found but body empty | `Reply found but body empty` | sentEmailId, gmailMessageId, partsStructure |
+| Reply check failed for thread | `Reply check failed for thread` | sentEmailId, gmailThreadId, error |
 | Reply check crash | `Reply check error` | message, stack |
 
 ### Campaign skip reasons (INFO)
@@ -385,6 +407,11 @@ All backend logs go to **stdout** (console). When running `npm run dev`, logs ap
 | `Send failed` + network/timeout | Gmail API or Zoho SMTP unreachable |
 | `getGmailMessageIdHeader failed` | Gmail API error fetching metadata (follow-up threading may not work) |
 | `Zoho IMAP check failed` | Zoho IMAP unreachable — reply detection may miss replies |
+| `Reply check failed for thread` | Gmail thread fetch failed (deleted, rate limit, auth) — reply body may be missing |
+| `Zoho reply check start` | Zoho reply check: accountId, sentCount, ourIdsSample |
+| `Zoho folder matches` | Zoho: matches found in folder (INBOX/Junk/Spam) |
+| `Zoho body extraction returned empty` | Zoho: raw fetched but extractZohoBodyFromRaw returned empty |
+| `Zoho match but body empty` | Zoho: reply matched but body extraction failed |
 | `Scheduler error` | Unhandled exception in entire send cycle |
 | Safari: "The string did not match the expected pattern" | Server returned HTML instead of JSON (e.g. 500 error page). Check server logs for real error. Frontend now checks Content-Type before parsing. |
 
@@ -393,7 +420,7 @@ All backend logs go to **stdout** (console). When running `npm run dev`, logs ap
 - **Logs:** Terminal where backend runs, or redirect stdout to a file: `npm run dev 2>&1 | tee backend.log`
 - **Sent emails:** History tab in UI, or `SentEmail` table in DB
 - **Lead status:** Campaign Edit → Leads tab (pending / sent / replied / bounce / auto_reply)
-- **Replies:** Replies tab — view all replies with full text, filter by type (human / bounce / auto-reply)
+- **Replies:** Replies tab — view all replies with full text; filter by campaign and type; expand row, Expand/Collapse for long replies; Refresh button when body not extracted
 
 ---
 
@@ -450,6 +477,72 @@ All backend logs go to **stdout** (console). When running `npm run dev`, logs ap
 ---
 
 ## 14. Changelog
+
+### 2026-02-19 (follow-up 3) — GitHub + Railway deploy
+
+**Production deploy:**
+- Backend serves frontend static files in production (`NODE_ENV=production`, `backend/public/`)
+- Root `package.json`: `build` copies frontend dist to `backend/public`, `start` runs backend
+- `railway.json` — Railway build/start config
+- `.github/workflows/deploy.yml` — GitHub Actions: build + deploy to Railway on push to main
+- README §3: Deploy to Railway (GitHub + production) — step-by-step
+
+### 2026-02-19 (follow-up 2) — Replies sort by received, bounce detection improvements
+
+**Replies tab:**
+- Sort by `replyAt` (newest first) when filtering replied/bounce/auto_reply
+- Column "Date" renamed to "Received"; shows reply received time + sent time below
+- Backend `GET /api/history`: `orderBy` uses `replyAt desc` when status filter is replies-only
+
+**Bounce detection (`replyType.ts`):**
+- Extended `BOUNCE_PATTERNS`: `could not be delivered`, `sender address blocked`, `mail delivery software`, `created automatically by mail`, `action: failed`, `diagnostic-code`, `reporting-mta`, `554` + DSN code
+- Fixes misclassification of DSN bounces (e.g. "Sender Address Blocked") as human
+
+### 2026-02-19 — Reply body extraction improvements, re-check, UI, refresh API
+
+**Gmail body extraction (`gmailBody.ts`):**
+- Recursive traversal for nested multipart (e.g. multipart/mixed → multipart/alternative → text/plain)
+- Fetch body via `messages.attachments.get()` when `body.data` is null (large messages)
+- Charset support from Content-Type (utf-8, latin1)
+- Function is now async; accepts opts `{ gmail, userId, messageId }` for attachment fetch
+
+**Reply checker (`replyChecker.ts`):**
+- Re-check replied/bounce/auto_reply with empty replyBody — backfill body on next run
+- Sort thread messages by internalDate before finding reply
+- Batch limit 150 (env `REPLY_CHECK_GMAIL_LIMIT`), 100 ms delay between Gmail requests
+- Lock prevents concurrent checkReplies runs
+- Proper logging: `Reply check failed for thread`, `Reply found but body empty`
+- Zoho: INBOX + Junk + Spam folders; last 500 emails (was 200)
+- Zoho: recursive multipart in `extractZohoBodyFromRaw`; charset in `decodePartBody`
+- Zoho: re-check for replied with empty body
+
+**API:**
+- `POST /api/history/:id/refresh-reply` — manually re-fetch reply body (Gmail and Zoho)
+
+**UI (Replies tab):**
+- Reply body maxHeight 500 (was 300); Expand/Collapse button for full view
+- "Body not extracted" + Refresh button when reply detected but body empty
+
+### 2026-02-19 (follow-up) — Zoho manual refresh, diagnostic logging, Sent folder, bounce search, body truncation fix
+
+**Zoho folders:**
+- Added Sent, Sent Items to search (replies often appear in Sent in Zoho)
+
+**Bounce detection:**
+- When In-Reply-To/References are empty, search by Message-ID in body — finds bounces (DSN) that don't have these headers
+
+**Body truncation fix:**
+- `extractZohoBodyFromRaw`: split by actual boundary instead of `\n--` — signatures with `--` no longer truncate the body
+- Support for non-standard boundary format (e.g. `boundary="--_NmP-..."`)
+
+**Zoho manual refresh:**
+- `POST /api/history/:id/refresh-reply` now supports Zoho — IMAP search in INBOX/Sent/Junk/Spam, fetch body, update replyBody
+
+**Zoho diagnostic logging:**
+- `Zoho reply check start` — accountId, sentCount, ourIdsSample
+- `Zoho folder matches` — when matches found in a folder
+- `Zoho body extraction returned empty` — raw length, preview, hasMultipart (when extractZohoBodyFromRaw returns empty)
+- `Zoho match but body empty` — when reply matched but body extraction failed
 
 ### 2026-02-17 — Reply body storage, bounce/auto-reply detection, Replies tab
 

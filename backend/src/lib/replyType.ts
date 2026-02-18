@@ -19,6 +19,14 @@ const BOUNCE_PATTERNS = [
   /delivery\s*status/i,
   /permanent\s*error/i,
   /fatal\s*error/i,
+  /could\s*not\s*be\s*delivered/i,
+  /sender\s*address\s*blocked/i,
+  /mail\s*delivery\s*software/i,
+  /created\s*automatically\s*by\s*mail/i,
+  /action:\s*failed/i,
+  /diagnostic-code/i,
+  /reporting-mta/i,
+  /\b554\b.*\d+\.\d+\.\d+/i,
 ];
 
 const AUTO_REPLY_PATTERNS = [

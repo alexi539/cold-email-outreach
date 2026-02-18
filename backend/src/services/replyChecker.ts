@@ -1,12 +1,15 @@
 import { google } from "googleapis";
 import Imap from "imap";
 import { prisma } from "../lib/prisma.js";
-import { logger } from "../lib/logger.js";
+import { logger, formatError } from "../lib/logger.js";
 import { getDecryptedOAuth, getDecryptedPassword } from "../lib/accounts.js";
 import { updateCampaignStatusFromCompletion } from "./campaignCompletion.js";
 import { extractGmailBody } from "../lib/gmailBody.js";
 import { detectReplyType } from "../lib/replyType.js";
 import type { gmail_v1 } from "googleapis";
+
+const GMAIL_BATCH_LIMIT = Number(process.env.REPLY_CHECK_GMAIL_LIMIT) || 150;
+const GMAIL_REQUEST_DELAY_MS = 100;
 
 async function applyReplyUpdate(
   sentEmailId: string,
@@ -37,6 +40,18 @@ async function applyReplyUpdate(
   );
 }
 
+async function applyReplyBodyOnlyUpdate(sentEmailId: string, replyBody: string) {
+  await prisma.sentEmail.update({
+    where: { id: sentEmailId },
+    data: { replyBody },
+  });
+  logger.info("Reply body backfilled", { sentEmailId });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 async function checkGmailReplies() {
   const accounts = await prisma.emailAccount.findMany({
     where: { accountType: "google", isActive: true },
@@ -56,8 +71,19 @@ async function checkGmailReplies() {
     const gmail = google.gmail({ version: "v1", auth: oauth2Client });
 
     const sent = await prisma.sentEmail.findMany({
-      where: { accountId: account.id, status: "sent", gmailThreadId: { not: null } },
+      where: {
+        accountId: account.id,
+        gmailThreadId: { not: null },
+        OR: [
+          { status: "sent" },
+          {
+            status: { in: ["replied", "bounce", "auto_reply"] },
+            OR: [{ replyBody: null }, { replyBody: "" }],
+          },
+        ],
+      },
       include: { lead: true },
+      take: GMAIL_BATCH_LIMIT,
     });
 
     for (const s of sent) {
@@ -69,6 +95,11 @@ async function checkGmailReplies() {
           format: "full",
         });
         const messages = (thread.messages || []) as gmail_v1.Schema$Message[];
+        messages.sort(
+          (a, b) =>
+            (typeof a.internalDate === "string" ? parseInt(a.internalDate, 10) : 0) -
+            (typeof b.internalDate === "string" ? parseInt(b.internalDate, 10) : 0)
+        );
         const ourSentAt = s.sentAt ? new Date(s.sentAt) : new Date(0);
         const ourSentAtMs = ourSentAt.getTime();
 
@@ -85,23 +116,50 @@ async function checkGmailReplies() {
               ? parseInt(replyMsg.internalDate, 10)
               : Date.now()
           );
-          const replyBody = extractGmailBody(replyMsg.payload);
+          const extractOpts = { gmail, userId: "me", messageId: String(replyMsg.id ?? "") };
+          const replyBody = await extractGmailBody(replyMsg.payload, extractOpts);
           const replySubject =
             replyMsg.payload?.headers?.find((h) => h.name?.toLowerCase() === "subject")?.value || "";
-          const replyType = detectReplyType(replyBody, replySubject, ourSentAt, replyAt);
 
-          await applyReplyUpdate(s.id, s.leadId, s.campaignId, replyBody, replyAt, replyType);
+          if (replyBody === "" && replyMsg.payload?.parts?.length) {
+            logger.warn("Reply found but body empty", {
+              sentEmailId: s.id,
+              gmailMessageId: replyMsg.id,
+              partsStructure: replyMsg.payload.parts.map((p) => ({
+                mimeType: p.mimeType,
+                hasData: !!p.body?.data,
+                hasAttachmentId: !!p.body?.attachmentId,
+              })),
+            });
+          }
+
+          const isRecheck = ["replied", "bounce", "auto_reply"].includes(s.status) && !s.replyBody?.trim();
+          if (isRecheck && replyBody) {
+            await applyReplyBodyOnlyUpdate(s.id, replyBody);
+          } else if (!isRecheck) {
+            const replyType = detectReplyType(replyBody, replySubject, ourSentAt, replyAt);
+            await applyReplyUpdate(s.id, s.leadId, s.campaignId, replyBody, replyAt, replyType);
+          }
         }
-      } catch {
-        // thread may be deleted
+
+        await sleep(GMAIL_REQUEST_DELAY_MS);
+      } catch (e) {
+        logger.warn("Reply check failed for thread", {
+          sentEmailId: s.id,
+          gmailThreadId: s.gmailThreadId,
+          error: formatError(e),
+        });
       }
     }
   }
 }
 
 function normalizeMsgId(id: string): string {
-  return id.replace(/^<|>$/g, "").trim();
+  return id.replace(/^<|>$/g, "").replace(/\s+/g, "").trim();
 }
+
+const ZOHO_FETCH_LIMIT = 500;
+const ZOHO_FOLDERS = ["INBOX", "Sent", "Sent Items", "Junk", "Spam"] as const;
 
 async function checkZohoReplies() {
   const accounts = await prisma.emailAccount.findMany({
@@ -113,13 +171,29 @@ async function checkZohoReplies() {
     if (!password) continue;
 
     const sent = await prisma.sentEmail.findMany({
-      where: { accountId: account.id, status: "sent", messageId: { not: null } },
+      where: {
+        accountId: account.id,
+        messageId: { not: null },
+        OR: [
+          { status: "sent" },
+          {
+            status: { in: ["replied", "bounce", "auto_reply"] },
+            OR: [{ replyBody: null }, { replyBody: "" }],
+          },
+        ],
+      },
       include: { lead: true },
     });
 
     if (sent.length === 0) continue;
 
     const ourIds = new Set(sent.map((s) => normalizeMsgId(s.messageId!)).filter(Boolean));
+    logger.info("Zoho reply check start", {
+      accountId: account.id,
+      accountEmail: account.email,
+      sentCount: sent.length,
+      ourIdsSample: [...ourIds].slice(0, 3),
+    });
 
     try {
       await new Promise<void>((resolve, reject) => {
@@ -132,49 +206,66 @@ async function checkZohoReplies() {
           tls: true,
         });
 
-        type MatchInfo = { id: string; leadId: string; campaignId: string; uid: number };
+        type MatchInfo = { id: string; leadId: string; campaignId: string; uid: number; folder: string };
         const matchesFound = new Map<string, MatchInfo>();
+        const processedIds = new Set<string>();
 
-        imap.once("ready", () => {
-          imap.openBox("INBOX", false, (err) => {
+        function processFolder(folder: string, cb: (err?: Error) => void) {
+          imap.openBox(folder, false, (err) => {
             if (err) {
+              if (folder !== "INBOX") {
+                return cb();
+              }
               imap.end();
               return reject(err);
             }
             imap.search(["ALL"], (searchErr, uids) => {
-              if (searchErr || !uids?.length) {
-                imap.end();
-                return resolve();
-              }
-              const fetch = imap.fetch(uids.slice(-200), {
-                bodies: "HEADER.FIELDS (IN-REPLY-TO REFERENCES)",
-                struct: true,
-              });
+              if (searchErr || !uids?.length) return cb();
+              const fetch = imap.fetch(uids.slice(-ZOHO_FETCH_LIMIT), { bodies: "" });
+              const rawByUid = new Map<number, { raw: string; replyAt: Date }>();
               fetch.on("message", (msg) => {
                 const state: { uid?: number; matchData?: { id: string; leadId: string; campaignId: string } } = {};
-                msg.on("attributes", (attrs: { uid?: number }) => {
+                let fullRaw = "";
+                msg.on("attributes", (attrs: { uid?: number; date?: Date }) => {
                   state.uid = attrs.uid;
+                  if (state.uid != null) {
+                    rawByUid.set(state.uid, { raw: "", replyAt: attrs.date ?? new Date() });
+                  }
                   if (state.matchData && state.uid != null && !matchesFound.has(state.matchData.id)) {
-                    matchesFound.set(state.matchData.id, { ...state.matchData, uid: state.uid });
+                    matchesFound.set(state.matchData.id, { ...state.matchData, uid: state.uid, folder });
                   }
                 });
                 msg.on("body", (stream: NodeJS.ReadableStream) => {
-                  let buf = "";
                   stream.on("data", (chunk: Buffer) => {
-                    buf += chunk.toString();
+                    fullRaw += chunk.toString("utf-8");
                   });
-                  stream.on("end", () => {
-                    const folded = buf.replace(/\r?\n[\s]+/g, " ");
-                    const inReplyTo = folded.match(/In-Reply-To:\s*(.+?)(?:\r?\n|$)/i)?.[1]?.trim();
-                    const refs = folded.match(/References:\s*(.+?)(?:\r?\n|$)/i)?.[1]?.trim()?.split(/\s+/) || [];
-                    const ids = [inReplyTo, ...refs].filter((x): x is string => Boolean(x)).map(normalizeMsgId);
-                    for (const id of ids) {
+                });
+                msg.on("end", () => {
+                  if (state.uid != null) {
+                    const prev = rawByUid.get(state.uid);
+                    rawByUid.set(state.uid, { raw: fullRaw, replyAt: prev?.replyAt ?? new Date() });
+                  }
+                  const headerEnd = fullRaw.indexOf("\r\n\r\n");
+                  const headerSection = headerEnd >= 0 ? fullRaw.slice(0, headerEnd) : fullRaw;
+                  const folded = headerSection.replace(/\r?\n[\s]+/g, " ");
+                  const inReplyTo = folded.match(/In-Reply-To:\s*(.+?)(?:\r?\n|$)/i)?.[1]?.trim();
+                  const refs = folded.match(/References:\s*(.+?)(?:\r?\n|$)/i)?.[1]?.trim()?.split(/\s+/) || [];
+                  let ids = [inReplyTo, ...refs].filter((x): x is string => Boolean(x)).map(normalizeMsgId);
+                  if (ids.length === 0) {
+                    for (const id of ourIds) {
+                      if (fullRaw.includes(id) || fullRaw.includes(`<${id}>`)) {
+                        ids = [id];
+                        break;
+                      }
+                    }
+                  }
+                  for (const id of ids) {
                       if (ourIds.has(id)) {
                         const match = sent.find((s) => normalizeMsgId(s.messageId!) === id);
                         if (match && !matchesFound.has(match.id)) {
                           const matchData = { id: match.id, leadId: match.leadId, campaignId: match.campaignId };
                           if (state.uid != null) {
-                            matchesFound.set(match.id, { ...matchData, uid: state.uid });
+                            matchesFound.set(match.id, { ...matchData, uid: state.uid, folder });
                           } else {
                             state.matchData = matchData;
                           }
@@ -184,65 +275,76 @@ async function checkZohoReplies() {
                     }
                   });
                 });
-              });
               fetch.once("end", () => {
-                const matchedUids = [...matchesFound.values()].map((m) => m.uid).filter((u): u is number => u != null);
-                if (matchedUids.length === 0) {
-                  imap.end();
-                  return resolve();
+                const folderMatches = [...matchesFound.values()].filter((m) => m.folder === folder);
+                const matchedUids = folderMatches.map((m) => m.uid).filter((u): u is number => u != null);
+                if (folderMatches.length > 0) {
+                  logger.info("Zoho folder matches", { folder, matchCount: folderMatches.length, sentEmailIds: folderMatches.map((m) => m.id) });
                 }
-                // Second fetch: get body for matched messages
-                const fetchStream = imap.fetch(matchedUids, { bodies: "" });
+                if (matchedUids.length === 0) return cb();
                 const bodyByUid = new Map<number, { body: string; replyAt: Date }>();
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                fetchStream.on("message", (msg: any) => {
-                    let msgUid: number | undefined;
-                    let replyAt = new Date();
-                    let fullRaw = "";
-                    msg.on("attributes", (attrs: { uid?: number; date?: Date }) => {
-                      msgUid = attrs.uid;
-                      if (attrs.date) replyAt = attrs.date;
-                    });
-                    msg.on("body", (stream: NodeJS.ReadableStream) => {
-                      stream.on("data", (chunk: Buffer) => {
-                        fullRaw += chunk.toString("utf-8");
+                for (const uid of matchedUids) {
+                  const entry = rawByUid.get(uid);
+                  if (entry) {
+                    const body = extractZohoBodyFromRaw(entry.raw);
+                    bodyByUid.set(uid, { body, replyAt: entry.replyAt });
+                    if (!body && entry.raw.length > 0) {
+                      logger.warn("Zoho body extraction returned empty", {
+                        uid,
+                        rawLength: entry.raw.length,
+                        rawPreview: entry.raw.slice(0, 500).replace(/[\r\n]/g, " "),
+                        hasMultipart: entry.raw.toLowerCase().includes("multipart"),
                       });
-                    });
-                    msg.on("end", () => {
-                      const body = extractZohoBodyFromRaw(fullRaw);
-                      if (msgUid != null) bodyByUid.set(msgUid, { body, replyAt });
-                    });
-                  });
-                fetchStream.once("end", async () => {
-                    imap.end();
-                    for (const match of matchesFound.values()) {
-                      try {
-                        const entry = bodyByUid.get(match.uid);
-                        const replyBody = entry?.body ?? "";
-                        const replyAt = entry?.replyAt ?? new Date();
-                        const sentRec = sent.find((x) => x.id === match.id);
-                        if (!sentRec) continue;
-                        const ourSentAt = sentRec.sentAt ? new Date(sentRec.sentAt) : new Date(0);
-                        const replySubject = ""; // Zoho: subject not easily available in this flow
-                        const replyType = detectReplyType(replyBody, replySubject, ourSentAt, replyAt);
-
-                        await applyReplyUpdate(
-                          match.id,
-                          match.leadId,
-                          match.campaignId,
-                          replyBody,
-                          replyAt,
-                          replyType
-                        );
-                      } catch (e) {
-                        logger.error("Zoho reply update failed", { match, error: e });
-                      }
                     }
-                    resolve();
-                });
+                  }
+                }
+                void (async () => {
+                  for (const match of folderMatches) {
+                    if (processedIds.has(match.id)) continue;
+                    processedIds.add(match.id);
+                    try {
+                      const entry = bodyByUid.get(match.uid);
+                      const replyBody = entry?.body ?? "";
+                      const replyAt = entry?.replyAt ?? new Date();
+                      const sentRec = sent.find((x) => x.id === match.id);
+                      if (!sentRec) continue;
+                      const ourSentAt = sentRec.sentAt ? new Date(sentRec.sentAt) : new Date(0);
+                      const replySubject = "";
+                      const replyType = detectReplyType(replyBody, replySubject, ourSentAt, replyAt);
+                      const isRecheck = ["replied", "bounce", "auto_reply"].includes(sentRec.status) && !sentRec.replyBody?.trim();
+                      if (!replyBody) {
+                        logger.warn("Zoho match but body empty", { sentEmailId: match.id, folder, isRecheck });
+                      }
+                      if (isRecheck && replyBody) {
+                        await applyReplyBodyOnlyUpdate(match.id, replyBody);
+                      } else if (!isRecheck) {
+                        await applyReplyUpdate(match.id, match.leadId, match.campaignId, replyBody, replyAt, replyType);
+                      }
+                    } catch (e) {
+                      logger.error("Zoho reply update failed", { match, error: e });
+                    }
+                  }
+                  cb();
+                })();
               });
             });
           });
+        }
+
+        imap.once("ready", () => {
+          let idx = 0;
+          function next() {
+            if (idx >= ZOHO_FOLDERS.length) {
+              imap.end();
+              return resolve();
+            }
+            processFolder(ZOHO_FOLDERS[idx], (err) => {
+              if (err) return reject(err);
+              idx++;
+              next();
+            });
+          }
+          next();
         });
         imap.once("error", reject);
         imap.connect();
@@ -253,13 +355,23 @@ async function checkZohoReplies() {
   }
 }
 
-/** Decode MIME part body by Content-Transfer-Encoding */
+function parsePartCharset(headersSection: string): BufferEncoding {
+  const match = headersSection.match(/charset\s*=\s*["']?([^"'\s;]+)/i);
+  if (!match) return "utf-8";
+  const raw = match[1].toLowerCase();
+  if (raw === "utf-8" || raw === "utf8") return "utf-8";
+  if (raw === "iso-8859-1" || raw === "latin1") return "latin1";
+  return "utf-8";
+}
+
+/** Decode MIME part body by Content-Transfer-Encoding and charset */
 function decodePartBody(raw: string, headersSection: string): string {
   const enc = headersSection.match(/content-transfer-encoding:\s*(\S+)/i)?.[1]?.toLowerCase();
+  const charset = parsePartCharset(headersSection);
   const trimmed = raw.replace(/\r?\n$/, "").trim();
   if (enc === "base64") {
     try {
-      return Buffer.from(trimmed.replace(/\s/g, ""), "base64").toString("utf-8");
+      return Buffer.from(trimmed.replace(/\s/g, ""), "base64").toString(charset);
     } catch {
       return trimmed;
     }
@@ -273,7 +385,11 @@ function decodePartBody(raw: string, headersSection: string): string {
   return trimmed;
 }
 
-/** Extract plain text body from raw MIME message (simple parser) */
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Extract plain text body from raw MIME message (recursive for nested multipart) */
 function extractZohoBodyFromRaw(raw: string): string {
   const parts = raw.split(/\r?\n\r?\n/);
   if (parts.length < 2) return "";
@@ -287,9 +403,9 @@ function extractZohoBodyFromRaw(raw: string): string {
     }
     return body.trim();
   }
-  const boundaryMatch = headers.match(/boundary="?([^";\s]+)"?/);
+  const boundaryMatch = headers.match(/boundary="?\s*[-]?([^";\s]+)"?/i);
   if (!boundaryMatch) return "";
-  const boundary = boundaryMatch[1].trim();
+  const boundary = boundaryMatch[1].trim().replace(/^--+/, "");
   const boundaryStr = `--${boundary}`;
   const sections = raw.split(boundaryStr);
   let text = "";
@@ -297,7 +413,16 @@ function extractZohoBodyFromRaw(raw: string): string {
     const subParts = section.split(/\r?\n\r?\n/, 2);
     if (subParts.length < 2) continue;
     const subHeaders = subParts[0].toLowerCase();
-    const subBodyRaw = subParts[1].split(/\r?\n--/)[0].trim();
+    const boundaryDelim = new RegExp(`\\r?\\n${escapeRegex(boundaryStr)}(--)?`, "i");
+    const subBodyRaw = subParts[1].split(boundaryDelim)[0].trim();
+    if (subHeaders.includes("multipart/")) {
+      const nestedRaw = subParts[0] + "\n\n" + subParts[1];
+      const nested = extractZohoBodyFromRaw(nestedRaw);
+      if (nested) {
+        text = nested;
+        break;
+      }
+    }
     const subBody = decodePartBody(subBodyRaw, subParts[0]);
     if (subHeaders.includes("text/plain")) {
       text = subBody;
@@ -310,7 +435,210 @@ function extractZohoBodyFromRaw(raw: string): string {
   return text;
 }
 
+/** Refresh reply body for a single sent email (Gmail or Zoho). Used by manual refresh API. */
+export async function refreshReplyForSentEmail(sentEmailId: string): Promise<{ updated: boolean; error?: string }> {
+  const sent = await prisma.sentEmail.findFirst({
+    where: { id: sentEmailId },
+    include: { lead: true, account: true },
+  });
+  if (!sent) return { updated: false, error: "Sent email not found" };
+  if (!sent.account) return { updated: false, error: "Account not found" };
+
+  const account = sent.account;
+
+  if (account.accountType === "google" && sent.gmailThreadId) {
+    try {
+      const tokens = getDecryptedOAuth(account);
+      if (!tokens?.refresh_token) return { updated: false, error: "No OAuth tokens" };
+      const oauth2Client = new google.auth.OAuth2(
+        process.env.GOOGLE_CLIENT_ID,
+        process.env.GOOGLE_CLIENT_SECRET,
+        undefined
+      );
+      oauth2Client.setCredentials(tokens);
+      const gmail = google.gmail({ version: "v1", auth: oauth2Client });
+      const { data: thread } = await gmail.users.threads.get({
+        userId: "me",
+        id: sent.gmailThreadId,
+        format: "full",
+      });
+      const messages = (thread.messages || []) as gmail_v1.Schema$Message[];
+      messages.sort(
+        (a, b) =>
+          (typeof a.internalDate === "string" ? parseInt(a.internalDate, 10) : 0) -
+          (typeof b.internalDate === "string" ? parseInt(b.internalDate, 10) : 0)
+      );
+      const ourSentAt = sent.sentAt ? new Date(sent.sentAt) : new Date(0);
+      const ourSentAtMs = ourSentAt.getTime();
+      const replyMsg = messages.find((m) => {
+        const msgTime = typeof m.internalDate === "string" ? parseInt(m.internalDate, 10) : 0;
+        if (msgTime <= ourSentAtMs) return false;
+        const from = m.payload?.headers?.find((h) => h.name?.toLowerCase() === "from")?.value || "";
+        return !from.toLowerCase().includes(account.email);
+      });
+      if (!replyMsg) return { updated: false, error: "No reply in thread" };
+      const replyAt = new Date(
+        typeof replyMsg.internalDate === "string" ? parseInt(replyMsg.internalDate, 10) : Date.now()
+      );
+      const extractOpts = { gmail, userId: "me", messageId: String(replyMsg.id ?? "") };
+      const replyBody = await extractGmailBody(replyMsg.payload, extractOpts);
+      const replySubject =
+        replyMsg.payload?.headers?.find((h) => h.name?.toLowerCase() === "subject")?.value || "";
+      const isRecheck = ["replied", "bounce", "auto_reply"].includes(sent.status) && !sent.replyBody?.trim();
+      if (isRecheck && replyBody) {
+        await applyReplyBodyOnlyUpdate(sentEmailId, replyBody);
+        return { updated: true };
+      }
+      if (!isRecheck) {
+        const replyType = detectReplyType(replyBody, replySubject, ourSentAt, replyAt);
+        await applyReplyUpdate(sent.id, sent.leadId, sent.campaignId, replyBody, replyAt, replyType);
+        return { updated: true };
+      }
+      return { updated: false };
+    } catch (e) {
+      logger.warn("Refresh reply failed", { sentEmailId, error: formatError(e) });
+      return { updated: false, error: (e instanceof Error ? e.message : String(e)) };
+    }
+  }
+
+  if (account.accountType === "zoho" && sent.messageId) {
+    return refreshZohoReplyForSentEmail(sent);
+  }
+
+  return { updated: false, error: "No gmailThreadId or messageId" };
+}
+
+/** Manual refresh of reply body for a single Zoho sent email via IMAP */
+async function refreshZohoReplyForSentEmail(sent: {
+  id: string;
+  leadId: string;
+  campaignId: string;
+  messageId: string | null;
+  replyBody: string | null;
+  status: string;
+  sentAt: Date | null;
+  account: { id: string; email: string; zohoProServers: boolean | null; smtpPasswordEncrypted: string | null };
+}): Promise<{ updated: boolean; error?: string }> {
+  if (!sent.messageId) return { updated: false, error: "No messageId" };
+  const password = getDecryptedPassword(sent.account);
+  if (!password) return { updated: false, error: "No password for Zoho account" };
+
+  const ourId = normalizeMsgId(sent.messageId);
+  const imapHost = sent.account.zohoProServers ? "imappro.zoho.com" : "imap.zoho.com";
+
+  try {
+    const result = await new Promise<{ body: string; replyAt: Date } | null>((resolve, reject) => {
+      const imap = new Imap({
+        user: sent.account.email,
+        password,
+        host: imapHost,
+        port: 993,
+        tls: true,
+      });
+
+      let found: { uid: number; folder: string; raw: string; replyAt: Date } | null = null;
+
+      function processFolder(folder: string, cb: (err?: Error) => void) {
+        imap.openBox(folder, false, (err) => {
+          if (err) {
+            if (folder !== "INBOX") return cb();
+            imap.end();
+            return reject(err);
+          }
+          imap.search(["ALL"], (searchErr, uids) => {
+            if (searchErr || !uids?.length) return cb();
+            const fetch = imap.fetch(uids.slice(-ZOHO_FETCH_LIMIT), { bodies: "" });
+            fetch.on("message", (msg) => {
+              const state: { uid?: number; date?: Date } = {};
+              let fullRaw = "";
+              msg.on("attributes", (attrs: { uid?: number; date?: Date }) => {
+                state.uid = attrs.uid;
+                state.date = attrs.date;
+              });
+              msg.on("body", (stream: NodeJS.ReadableStream) => {
+                stream.on("data", (chunk: Buffer) => {
+                  fullRaw += chunk.toString("utf-8");
+                });
+              });
+              msg.on("end", () => {
+                const headerEnd = fullRaw.indexOf("\r\n\r\n");
+                const headerSection = headerEnd >= 0 ? fullRaw.slice(0, headerEnd) : fullRaw;
+                const folded = headerSection.replace(/\r?\n[\s]+/g, " ");
+                const inReplyTo = folded.match(/In-Reply-To:\s*(.+?)(?:\r?\n|$)/i)?.[1]?.trim();
+                const refs = folded.match(/References:\s*(.+?)(?:\r?\n|$)/i)?.[1]?.trim()?.split(/\s+/) || [];
+                let ids = [inReplyTo, ...refs].filter((x): x is string => Boolean(x)).map(normalizeMsgId);
+                if (ids.length === 0 && (fullRaw.includes(ourId) || fullRaw.includes(`<${ourId}>`))) {
+                  ids = [ourId];
+                }
+                if (ids.some((id) => id === ourId) && state.uid != null && !found) {
+                  found = { uid: state.uid, folder, raw: fullRaw, replyAt: state.date ?? new Date() };
+                }
+              });
+            });
+            fetch.once("end", () => {
+              if (found) return cb();
+              cb();
+            });
+          });
+        });
+      }
+
+      imap.once("ready", () => {
+        let idx = 0;
+        function next() {
+          if (found || idx >= ZOHO_FOLDERS.length) {
+            if (!found) {
+              imap.end();
+              return resolve(null);
+            }
+            imap.end();
+            const body = extractZohoBodyFromRaw(found.raw);
+            resolve(body ? { body, replyAt: found.replyAt } : null);
+          } else {
+            processFolder(ZOHO_FOLDERS[idx], (err) => {
+              if (err) return reject(err);
+              idx++;
+              next();
+            });
+          }
+        }
+        next();
+      });
+      imap.once("error", reject);
+      imap.connect();
+    });
+
+    if (!result) {
+      return { updated: false, error: "Reply not found in INBOX/Sent/Junk/Spam" };
+    }
+    if (!result.body) {
+      return { updated: false, error: "Reply found but body extraction failed" };
+    }
+
+    const ourSentAt = sent.sentAt ? new Date(sent.sentAt) : new Date(0);
+    const isRecheck = ["replied", "bounce", "auto_reply"].includes(sent.status) && !sent.replyBody?.trim();
+    if (isRecheck) {
+      await applyReplyBodyOnlyUpdate(sent.id, result.body);
+      return { updated: true };
+    }
+    const replyType = detectReplyType(result.body, "", ourSentAt, result.replyAt);
+    await applyReplyUpdate(sent.id, sent.leadId, sent.campaignId, result.body, result.replyAt, replyType);
+    return { updated: true };
+  } catch (e) {
+    logger.warn("Zoho refresh reply failed", { sentEmailId: sent.id, error: formatError(e) });
+    return { updated: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+let checkRepliesRunning = false;
+
 export async function checkReplies() {
-  await checkGmailReplies();
-  await checkZohoReplies();
+  if (checkRepliesRunning) return;
+  checkRepliesRunning = true;
+  try {
+    await checkGmailReplies();
+    await checkZohoReplies();
+  } finally {
+    checkRepliesRunning = false;
+  }
 }

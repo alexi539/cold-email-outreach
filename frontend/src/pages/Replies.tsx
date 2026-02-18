@@ -11,7 +11,9 @@ export default function Replies() {
   const [filterCampaign, setFilterCampaign] = useState<string>("");
   const [filterType, setFilterType] = useState<ReplyTypeFilter>("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [fullHeightId, setFullHeightId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [refreshingId, setRefreshingId] = useState<string | null>(null);
 
   const statusParam =
     filterType === ""
@@ -90,7 +92,7 @@ export default function Replies() {
           <table style={{ width: "100%", borderCollapse: "collapse" }}>
             <thead>
               <tr style={{ background: "#27272a" }}>
-                <th style={{ padding: "0.75rem 1rem", textAlign: "left", fontWeight: 600 }}>Date</th>
+                <th style={{ padding: "0.75rem 1rem", textAlign: "left", fontWeight: 600 }}>Received</th>
                 <th style={{ padding: "0.75rem 1rem", textAlign: "left", fontWeight: 600 }}>To</th>
                 <th style={{ padding: "0.75rem 1rem", textAlign: "left", fontWeight: 600 }}>Subject</th>
                 <th style={{ padding: "0.75rem 1rem", textAlign: "left", fontWeight: 600 }}>Campaign</th>
@@ -104,7 +106,18 @@ export default function Replies() {
                 <Fragment key={s.id}>
                   <tr style={{ borderTop: "1px solid #27272a" }}>
                     <td style={{ padding: "0.75rem 1rem", fontSize: "0.875rem" }}>
-                      {s.replyAt ? new Date(s.replyAt).toLocaleString() : new Date(s.sentAt).toLocaleString()}
+                      {s.replyAt ? (
+                        <>
+                          <span title="Reply received">{new Date(s.replyAt).toLocaleString()}</span>
+                          {s.sentAt && (
+                            <span style={{ color: "#71717a", fontSize: "0.75rem", display: "block", marginTop: "0.125rem" }}>
+                              sent {new Date(s.sentAt).toLocaleString()}
+                            </span>
+                          )}
+                        </>
+                      ) : (
+                        new Date(s.sentAt).toLocaleString()
+                      )}
                     </td>
                     <td style={{ padding: "0.75rem 1rem" }}>{s.lead?.email ?? "—"}</td>
                     <td style={{ padding: "0.75rem 1rem", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis" }}>{s.subject}</td>
@@ -133,7 +146,14 @@ export default function Replies() {
                     <td style={{ padding: "0.75rem 1rem" }}>
                       {s.replyBody ? (
                         <button
-                          onClick={() => setExpandedId(expandedId === s.id ? null : s.id)}
+                          onClick={() => {
+                            if (expandedId === s.id) {
+                              setExpandedId(null);
+                              setFullHeightId(null);
+                            } else {
+                              setExpandedId(s.id);
+                            }
+                          }}
                           style={{
                             padding: "0.25rem 0.5rem",
                             background: "#3f3f46",
@@ -146,6 +166,38 @@ export default function Replies() {
                         >
                           {expandedId === s.id ? "Hide" : "Show"}
                         </button>
+                      ) : s.replyAt ? (
+                        <span style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                          <span style={{ color: "#a78bfa", fontSize: "0.875rem" }} title="Reply detected but body not extracted.">
+                            Body not extracted
+                          </span>
+                          <button
+                            onClick={async () => {
+                              setRefreshingId(s.id);
+                              try {
+                                const r = await history.refreshReply(s.id);
+                                if (r.updated) refresh();
+                                else if (r.error) alert(r.error);
+                              } catch (e) {
+                                alert(e instanceof Error ? e.message : "Refresh failed");
+                              } finally {
+                                setRefreshingId(null);
+                              }
+                            }}
+                            disabled={refreshingId === s.id}
+                            style={{
+                              padding: "0.2rem 0.4rem",
+                              background: "#27272a",
+                              border: "1px solid #3f3f46",
+                              borderRadius: 4,
+                              color: "#a78bfa",
+                              cursor: refreshingId === s.id ? "not-allowed" : "pointer",
+                              fontSize: "0.75rem",
+                            }}
+                          >
+                            {refreshingId === s.id ? "..." : "Refresh"}
+                          </button>
+                        </span>
                       ) : (
                         <span style={{ color: "#71717a", fontSize: "0.875rem" }}>—</span>
                       )}
@@ -160,7 +212,7 @@ export default function Replies() {
                             fontFamily: "monospace",
                             fontSize: "0.8125rem",
                             color: "#d4d4d8",
-                            maxHeight: 300,
+                            maxHeight: fullHeightId === s.id ? "none" : 500,
                             overflow: "auto",
                             padding: "1rem",
                             background: "#18181b",
@@ -170,6 +222,21 @@ export default function Replies() {
                         >
                           {s.replyBody}
                         </div>
+                        <button
+                          onClick={() => setFullHeightId(fullHeightId === s.id ? null : s.id)}
+                          style={{
+                            marginTop: "0.5rem",
+                            padding: "0.25rem 0.5rem",
+                            background: "#27272a",
+                            border: "1px solid #3f3f46",
+                            borderRadius: 4,
+                            color: "#a1a1aa",
+                            cursor: "pointer",
+                            fontSize: "0.8125rem",
+                          }}
+                        >
+                          {fullHeightId === s.id ? "Collapse" : "Expand"}
+                        </button>
                       </td>
                     </tr>
                   )}

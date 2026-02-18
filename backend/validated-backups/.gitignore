@@ -1,0 +1,2 @@
+# Ignore backup files — they contain validated email data
+*.json

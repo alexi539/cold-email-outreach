@@ -1,0 +1,125 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model EmailAccount {
+  id                    String   @id @default(uuid())
+  email                 String   @unique
+  displayName           String?  @map("display_name")
+  accountType           String   @map("account_type") // google | zoho
+  dailyLimit             Int      @default(100) @map("daily_limit")
+  limitResetAt          DateTime? @map("limit_reset_at")
+  sentToday             Int      @default(0) @map("sent_today")
+  oauthTokens           String?  @map("oauth_tokens") // encrypted JSON for Google
+  smtpPasswordEncrypted String?  @map("smtp_password_encrypted") // for Zoho
+  zohoProServers        Boolean  @default(false) @map("zoho_pro_servers") // true = smtppro/imappro for custom domain
+  isActive              Boolean  @default(true) @map("is_active")
+  createdAt             DateTime @default(now()) @map("created_at")
+
+  campaignAccounts CampaignAccount[]
+  leads            Lead[]
+  sentEmails       SentEmail[]
+}
+
+model Campaign {
+  id                  String   @id @default(uuid())
+  name                String
+  dailyLimit          Int      @map("daily_limit")
+  status              String   @default("draft") // draft | active | paused | finished
+  startTime           String?  @map("start_time") // HH:mm MSK
+  workingHoursStart   String   @default("09:00") @map("working_hours_start")
+  workingHoursEnd     String   @default("18:00") @map("working_hours_end")
+  createdAt           DateTime @default(now()) @map("created_at")
+
+  campaignAccounts CampaignAccount[]
+  leads            Lead[]
+  sequence         Sequence?
+  sentEmails       SentEmail[]
+}
+
+model CampaignAccount {
+  campaignId String @map("campaign_id")
+  accountId  String @map("account_id")
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  account  EmailAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@id([campaignId, accountId])
+}
+
+model Sequence {
+  id                   String @id @default(uuid())
+  campaignId           String @unique @map("campaign_id")
+  throttleMinMinutes   Int    @default(2) @map("throttle_min_minutes")
+  throttleMaxMinutes   Int    @default(5) @map("throttle_max_minutes")
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  steps    SequenceStep[]
+}
+
+model SequenceStep {
+  id                      String  @id @default(uuid())
+  sequenceId               String  @map("sequence_id")
+  stepOrder                Int     @map("step_order") // 0=initial, 1=f-up1, 2=f-up2
+  subjectTemplate          String  @map("subject_template")
+  bodyTemplate             String  @map("body_template")
+  delayAfterPreviousDays   Int     @default(0) @map("delay_after_previous_days")
+
+  sequence Sequence @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+}
+
+model Lead {
+  id                String   @id @default(uuid())
+  campaignId        String   @map("campaign_id")
+  email             String
+  data              String   // JSON: {name, company, ...}
+  orderIndex        Int      @default(0) @map("order_index") // preserves CSV row order
+  assignedAccountId String?  @map("assigned_account_id")
+  currentStep       Int      @default(0) @map("current_step")
+  nextSendAt        DateTime? @map("next_send_at")
+  status            String   @default("pending") // pending | sent | replied | bounce | auto_reply | paused
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  account  EmailAccount? @relation(fields: [assignedAccountId], references: [id])
+  sentEmails SentEmail[]
+
+  @@unique([campaignId, email])
+}
+
+model SentEmail {
+  id              String    @id @default(uuid())
+  leadId          String    @map("lead_id")
+  accountId       String    @map("account_id")
+  campaignId      String    @map("campaign_id")
+  stepOrder       Int       @map("step_order")
+  subject         String
+  bodyPreview     String?   @map("body_preview")
+  sentAt          DateTime  @default(now()) @map("sent_at")
+  status          String    @default("sent") // sent | replied | bounce | auto_reply
+  gmailMessageId  String?   @map("gmail_message_id")
+  gmailThreadId   String?   @map("gmail_thread_id")
+  messageId       String?   @map("message_id") // For Zoho IMAP matching
+  replyBody       String?   @map("reply_body")
+  replyAt         DateTime? @map("reply_at")
+  replyType       String?   @map("reply_type") // human | bounce | auto_reply
+
+  lead    Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  account EmailAccount @relation(fields: [accountId], references: [id])
+  campaign Campaign @relation(fields: [campaignId], references: [id])
+}
+
+model ValidKitKeyUsage {
+  id            String   @id @default(uuid())
+  keyIndex      Int      @unique @map("key_index")
+  keyLabel      String   @map("key_label") // last 8 chars for display
+  usedThisMonth Int      @default(0) @map("used_this_month")
+  lastResetAt   DateTime @map("last_reset_at")
+  resetDay      Int      @default(17) @map("reset_day") // day of month when quota resets (1-28)
+  createdAt     DateTime @default(now()) @map("created_at")
+}

@@ -74,15 +74,8 @@ async function checkGmailReplies() {
       where: {
         accountId: account.id,
         gmailThreadId: { not: null },
-        OR: [
-          { status: "sent" },
-          {
-            status: { in: ["replied", "bounce", "auto_reply"] },
-            OR: [{ replyBody: null }, { replyBody: "" }],
-          },
-        ],
       },
-      include: { lead: true },
+      include: { lead: true, replyMessages: true },
       take: GMAIL_BATCH_LIMIT,
     });
 
@@ -102,43 +95,106 @@ async function checkGmailReplies() {
         );
         const ourSentAt = s.sentAt ? new Date(s.sentAt) : new Date(0);
         const ourSentAtMs = ourSentAt.getTime();
+        const existingIds = new Set(s.replyMessages.map((r: { externalId: string }) => r.externalId));
 
-        const replyMsg = messages.find((m) => {
+        const messagesAfterOurs = messages.filter((m) => {
           const msgTime = typeof m.internalDate === "string" ? parseInt(m.internalDate, 10) : 0;
-          if (msgTime <= ourSentAtMs) return false;
-          const from = m.payload?.headers?.find((h) => h.name?.toLowerCase() === "from")?.value || "";
-          return !from.toLowerCase().includes(account.email);
+          return msgTime > ourSentAtMs;
         });
 
-        if (replyMsg) {
-          const replyAt = new Date(
-            typeof replyMsg.internalDate === "string"
-              ? parseInt(replyMsg.internalDate, 10)
-              : Date.now()
-          );
-          const extractOpts = { gmail, userId: "me", messageId: String(replyMsg.id ?? "") };
-          const replyBody = await extractGmailBody(replyMsg.payload, extractOpts);
-          const replySubject =
-            replyMsg.payload?.headers?.find((h) => h.name?.toLowerCase() === "subject")?.value || "";
+        let latestLeadReply: { body: string; at: Date; type: "human" | "bounce" | "auto_reply" } | null = null;
 
-          if (replyBody === "" && replyMsg.payload?.parts?.length) {
-            logger.warn("Reply found but body empty", {
-              sentEmailId: s.id,
-              gmailMessageId: replyMsg.id,
-              partsStructure: replyMsg.payload.parts.map((p) => ({
-                mimeType: p.mimeType,
-                hasData: !!p.body?.data,
-                hasAttachmentId: !!p.body?.attachmentId,
-              })),
+        for (const msg of messagesAfterOurs) {
+          const gmailMsgId = String(msg.id ?? "");
+          const externalId = `gmail:${gmailMsgId}`;
+          if (existingIds.has(externalId)) continue;
+
+          const from = msg.payload?.headers?.find((h) => h.name?.toLowerCase() === "from")?.value || "";
+          const fromUs = from.toLowerCase().includes(account.email);
+
+          const replyAt = new Date(
+            typeof msg.internalDate === "string" ? parseInt(msg.internalDate, 10) : Date.now()
+          );
+
+          if (fromUs) {
+            await prisma.replyMessage.upsert({
+              where: { externalId },
+              create: {
+                sentEmailId: s.id,
+                externalId,
+                replyAt,
+                fromUs: true,
+              },
+              update: {},
             });
+          } else {
+            const extractOpts = { gmail, userId: "me", messageId: gmailMsgId };
+            const replyBody = await extractGmailBody(msg.payload, extractOpts);
+            const replySubject =
+              msg.payload?.headers?.find((h) => h.name?.toLowerCase() === "subject")?.value || "";
+            const replyType = detectReplyType(replyBody, replySubject, ourSentAt, replyAt);
+
+            await prisma.replyMessage.upsert({
+              where: { externalId },
+              create: {
+                sentEmailId: s.id,
+                externalId,
+                replyAt,
+                replyBody,
+                replyType,
+                fromUs: false,
+              },
+              update: { replyBody: replyBody || undefined, replyType },
+            });
+
+            latestLeadReply = { body: replyBody, at: replyAt, type: replyType };
           }
 
-          const isRecheck = ["replied", "bounce", "auto_reply"].includes(s.status) && !s.replyBody?.trim();
-          if (isRecheck && replyBody) {
-            await applyReplyBodyOnlyUpdate(s.id, replyBody);
-          } else if (!isRecheck) {
-            const replyType = detectReplyType(replyBody, replySubject, ourSentAt, replyAt);
-            await applyReplyUpdate(s.id, s.leadId, s.campaignId, replyBody, replyAt, replyType);
+          await sleep(GMAIL_REQUEST_DELAY_MS);
+        }
+
+        const allLeadReplies = await prisma.replyMessage.findMany({
+          where: { sentEmailId: s.id, fromUs: false },
+          orderBy: { replyAt: "desc" },
+          take: 1,
+        });
+        const latestRm = allLeadReplies[0];
+
+        if (latestRm) {
+          const replyType = (latestRm.replyType || "human") as "human" | "bounce" | "auto_reply";
+          const status = replyType === "human" ? "replied" : replyType;
+          const needsUpdate =
+            s.status !== status ||
+            s.replyBody !== latestRm.replyBody ||
+            !s.replyAt ||
+            new Date(s.replyAt).getTime() !== latestRm.replyAt.getTime();
+
+          if (needsUpdate) {
+            await prisma.$transaction([
+              prisma.sentEmail.update({
+                where: { id: s.id },
+                data: {
+                  status,
+                  replyBody: latestRm.replyBody,
+                  replyAt: latestRm.replyAt,
+                  replyType,
+                },
+              }),
+              prisma.lead.update({
+                where: { id: s.leadId },
+                data: { status },
+              }),
+            ]);
+            if (latestLeadReply) {
+              logger.info("Reply detected", {
+                leadId: s.leadId,
+                replyType: latestLeadReply.type,
+                campaignId: s.campaignId,
+              });
+              updateCampaignStatusFromCompletion(s.campaignId).catch((e) =>
+                logger.error("Campaign completion check after reply", { campaignId: s.campaignId, error: e })
+              );
+            }
           }
         }
 
@@ -174,20 +230,13 @@ async function checkZohoReplies() {
       where: {
         accountId: account.id,
         messageId: { not: null },
-        OR: [
-          { status: "sent" },
-          {
-            status: { in: ["replied", "bounce", "auto_reply"] },
-            OR: [{ replyBody: null }, { replyBody: "" }],
-          },
-        ],
       },
       include: { lead: true },
     });
 
     if (sent.length === 0) continue;
 
-    const ourIds = new Set(sent.map((s) => normalizeMsgId(s.messageId!)).filter(Boolean));
+    const ourIds = new Set(sent.map((s: { messageId: string | null }) => normalizeMsgId(s.messageId!)).filter(Boolean));
     logger.info("Zoho reply check start", {
       accountId: account.id,
       accountEmail: account.email,
@@ -206,9 +255,15 @@ async function checkZohoReplies() {
           tls: true,
         });
 
-        type MatchInfo = { id: string; leadId: string; campaignId: string; uid: number; folder: string };
-        const matchesFound = new Map<string, MatchInfo>();
-        const processedIds = new Set<string>();
+        type MatchInfo = {
+          sentEmailId: string;
+          leadId: string;
+          campaignId: string;
+          uid: number;
+          folder: string;
+          fromUs: boolean;
+        };
+        const matchesFound: MatchInfo[] = [];
 
         function processFolder(folder: string, cb: (err?: Error) => void) {
           imap.openBox(folder, false, (err) => {
@@ -223,16 +278,14 @@ async function checkZohoReplies() {
               if (searchErr || !uids?.length) return cb();
               const fetch = imap.fetch(uids.slice(-ZOHO_FETCH_LIMIT), { bodies: "" });
               const rawByUid = new Map<number, { raw: string; replyAt: Date }>();
+              const seenExternalIds = new Set<string>();
               fetch.on("message", (msg) => {
-                const state: { uid?: number; matchData?: { id: string; leadId: string; campaignId: string } } = {};
+                const state: { uid?: number } = {};
                 let fullRaw = "";
                 msg.on("attributes", (attrs: { uid?: number; date?: Date }) => {
                   state.uid = attrs.uid;
                   if (state.uid != null) {
                     rawByUid.set(state.uid, { raw: "", replyAt: attrs.date ?? new Date() });
-                  }
-                  if (state.matchData && state.uid != null && !matchesFound.has(state.matchData.id)) {
-                    matchesFound.set(state.matchData.id, { ...state.matchData, uid: state.uid, folder });
                   }
                 });
                 msg.on("body", (stream: NodeJS.ReadableStream) => {
@@ -241,18 +294,19 @@ async function checkZohoReplies() {
                   });
                 });
                 msg.on("end", () => {
-                  if (state.uid != null) {
-                    const prev = rawByUid.get(state.uid);
-                    rawByUid.set(state.uid, { raw: fullRaw, replyAt: prev?.replyAt ?? new Date() });
-                  }
+                  if (state.uid == null) return;
+                  const prev = rawByUid.get(state.uid);
+                  rawByUid.set(state.uid, { raw: fullRaw, replyAt: prev?.replyAt ?? new Date() });
                   const headerEnd = fullRaw.indexOf("\r\n\r\n");
                   const headerSection = headerEnd >= 0 ? fullRaw.slice(0, headerEnd) : fullRaw;
                   const folded = headerSection.replace(/\r?\n[\s]+/g, " ");
+                  const from = folded.match(/From:\s*(.+?)(?:\r?\n|$)/i)?.[1]?.trim() || "";
+                  const fromUs = from.toLowerCase().includes(account.email);
                   const inReplyTo = folded.match(/In-Reply-To:\s*(.+?)(?:\r?\n|$)/i)?.[1]?.trim();
                   const refs = folded.match(/References:\s*(.+?)(?:\r?\n|$)/i)?.[1]?.trim()?.split(/\s+/) || [];
                   let ids = [inReplyTo, ...refs].filter((x): x is string => Boolean(x)).map(normalizeMsgId);
                   if (ids.length === 0) {
-                    for (const id of ourIds) {
+                    for (const id of ourIds as Iterable<string>) {
                       if (fullRaw.includes(id) || fullRaw.includes(`<${id}>`)) {
                         ids = [id];
                         break;
@@ -260,65 +314,100 @@ async function checkZohoReplies() {
                     }
                   }
                   for (const id of ids) {
-                      if (ourIds.has(id)) {
-                        const match = sent.find((s) => normalizeMsgId(s.messageId!) === id);
-                        if (match && !matchesFound.has(match.id)) {
-                          const matchData = { id: match.id, leadId: match.leadId, campaignId: match.campaignId };
-                          if (state.uid != null) {
-                            matchesFound.set(match.id, { ...matchData, uid: state.uid, folder });
-                          } else {
-                            state.matchData = matchData;
-                          }
-                        }
-                        break;
+                    if (ourIds.has(id)) {
+                      const matched = sent.filter((s: { id: string; messageId: string | null }) => normalizeMsgId(s.messageId!) === id);
+                      for (const m of matched) {
+                        const extId = `zoho:${m.id}:${folder}:${state.uid}`;
+                        if (seenExternalIds.has(extId)) continue;
+                        seenExternalIds.add(extId);
+                        matchesFound.push({
+                          sentEmailId: m.id,
+                          leadId: m.leadId,
+                          campaignId: m.campaignId,
+                          uid: state.uid,
+                          folder,
+                          fromUs,
+                        });
                       }
+                      break;
                     }
-                  });
+                  }
                 });
+              });
               fetch.once("end", () => {
-                const folderMatches = [...matchesFound.values()].filter((m) => m.folder === folder);
-                const matchedUids = folderMatches.map((m) => m.uid).filter((u): u is number => u != null);
+                const folderMatches = matchesFound.filter((m) => m.folder === folder);
                 if (folderMatches.length > 0) {
-                  logger.info("Zoho folder matches", { folder, matchCount: folderMatches.length, sentEmailIds: folderMatches.map((m) => m.id) });
+                  logger.info("Zoho folder matches", {
+                    folder,
+                    matchCount: folderMatches.length,
+                    sentEmailIds: [...new Set(folderMatches.map((m) => m.sentEmailId))],
+                  });
                 }
-                if (matchedUids.length === 0) return cb();
+                if (folderMatches.length === 0) return cb();
                 const bodyByUid = new Map<number, { body: string; replyAt: Date }>();
-                for (const uid of matchedUids) {
-                  const entry = rawByUid.get(uid);
+                for (const m of folderMatches) {
+                  const entry = rawByUid.get(m.uid);
                   if (entry) {
                     const body = extractZohoBodyFromRaw(entry.raw);
-                    bodyByUid.set(uid, { body, replyAt: entry.replyAt });
-                    if (!body && entry.raw.length > 0) {
-                      logger.warn("Zoho body extraction returned empty", {
-                        uid,
-                        rawLength: entry.raw.length,
-                        rawPreview: entry.raw.slice(0, 500).replace(/[\r\n]/g, " "),
-                        hasMultipart: entry.raw.toLowerCase().includes("multipart"),
-                      });
-                    }
+                    bodyByUid.set(m.uid, { body, replyAt: entry.replyAt });
                   }
                 }
                 void (async () => {
                   for (const match of folderMatches) {
-                    if (processedIds.has(match.id)) continue;
-                    processedIds.add(match.id);
                     try {
                       const entry = bodyByUid.get(match.uid);
-                      const replyBody = entry?.body ?? "";
+                      const replyBody = match.fromUs ? "" : (entry?.body ?? "");
                       const replyAt = entry?.replyAt ?? new Date();
-                      const sentRec = sent.find((x) => x.id === match.id);
-                      if (!sentRec) continue;
-                      const ourSentAt = sentRec.sentAt ? new Date(sentRec.sentAt) : new Date(0);
-                      const replySubject = "";
-                      const replyType = detectReplyType(replyBody, replySubject, ourSentAt, replyAt);
-                      const isRecheck = ["replied", "bounce", "auto_reply"].includes(sentRec.status) && !sentRec.replyBody?.trim();
-                      if (!replyBody) {
-                        logger.warn("Zoho match but body empty", { sentEmailId: match.id, folder, isRecheck });
-                      }
-                      if (isRecheck && replyBody) {
-                        await applyReplyBodyOnlyUpdate(match.id, replyBody);
-                      } else if (!isRecheck) {
-                        await applyReplyUpdate(match.id, match.leadId, match.campaignId, replyBody, replyAt, replyType);
+                      const externalId = `zoho:${match.sentEmailId}:${folder}:${match.uid}`;
+                      await prisma.replyMessage.upsert({
+                        where: { externalId },
+                        create: {
+                          sentEmailId: match.sentEmailId,
+                          externalId,
+                          replyAt,
+                          replyBody: match.fromUs ? null : replyBody,
+                          replyType: match.fromUs ? null : (replyBody ? detectReplyType(replyBody, "", new Date(0), replyAt) : null),
+                          fromUs: match.fromUs,
+                        },
+                        update: match.fromUs ? {} : { replyBody: replyBody || undefined },
+                      });
+                      if (!match.fromUs && replyBody) {
+                        const sentRec = sent.find((x: { id: string }) => x.id === match.sentEmailId);
+                        if (sentRec) {
+                          const replyType = detectReplyType(replyBody, "", sentRec.sentAt ? new Date(sentRec.sentAt) : new Date(0), replyAt);
+                          const allLeadReplies = await prisma.replyMessage.findMany({
+                            where: { sentEmailId: match.sentEmailId, fromUs: false },
+                            orderBy: { replyAt: "desc" },
+                            take: 1,
+                          });
+                          const latestRm = allLeadReplies[0];
+                          if (latestRm) {
+                            const status = (latestRm.replyType || "human") === "human" ? "replied" : latestRm.replyType!;
+                            await prisma.$transaction([
+                              prisma.sentEmail.update({
+                                where: { id: match.sentEmailId },
+                                data: {
+                                  status,
+                                  replyBody: latestRm.replyBody,
+                                  replyAt: latestRm.replyAt,
+                                  replyType: latestRm.replyType,
+                                },
+                              }),
+                              prisma.lead.update({
+                                where: { id: match.leadId },
+                                data: { status },
+                              }),
+                            ]);
+                            logger.info("Reply detected", {
+                              leadId: match.leadId,
+                              replyType: latestRm.replyType,
+                              campaignId: match.campaignId,
+                            });
+                            updateCampaignStatusFromCompletion(match.campaignId).catch((e) =>
+                              logger.error("Campaign completion check after reply", { campaignId: match.campaignId, error: e })
+                            );
+                          }
+                        }
                       }
                     } catch (e) {
                       logger.error("Zoho reply update failed", { match, error: e });

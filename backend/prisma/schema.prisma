@@ -109,9 +109,22 @@ model SentEmail {
   replyAt         DateTime? @map("reply_at")
   replyType       String?   @map("reply_type") // human | bounce | auto_reply
 
-  lead    Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
-  account EmailAccount @relation(fields: [accountId], references: [id])
-  campaign Campaign @relation(fields: [campaignId], references: [id])
+  lead          Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  account       EmailAccount @relation(fields: [accountId], references: [id])
+  campaign      Campaign @relation(fields: [campaignId], references: [id])
+  replyMessages ReplyMessage[]
+}
+
+model ReplyMessage {
+  id             String    @id @default(uuid())
+  sentEmailId    String    @map("sent_email_id")
+  externalId     String    @unique @map("external_id") // gmail:{id} or zoho:{folder}:{uid}
+  replyAt        DateTime  @map("reply_at")
+  replyBody      String?   @map("reply_body")
+  replyType      String?   @map("reply_type") // human | bounce | auto_reply
+  fromUs         Boolean   @default(false) @map("from_us") // true = our manual reply
+
+  sentEmail SentEmail @relation(fields: [sentEmailId], references: [id], onDelete: Cascade)
 }
 
 model ValidKitKeyUsage {

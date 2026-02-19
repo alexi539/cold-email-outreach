@@ -1,12 +1,12 @@
 import { useEffect, useState, Fragment } from "react";
 import { Link } from "react-router-dom";
 import { history, campaigns } from "../api";
-import type { SentEmail, Campaign } from "../api";
+import type { ReplyMessage, Campaign } from "../api";
 
 type ReplyTypeFilter = "" | "replied" | "bounce" | "auto_reply";
 
 export default function Replies() {
-  const [list, setList] = useState<SentEmail[]>([]);
+  const [list, setList] = useState<(ReplyMessage & { answered?: boolean })[]>([]);
   const [campaignsList, setCampaignsList] = useState<Campaign[]>([]);
   const [filterCampaign, setFilterCampaign] = useState<string>("");
   const [filterType, setFilterType] = useState<ReplyTypeFilter>("");
@@ -23,7 +23,7 @@ export default function Replies() {
   useEffect(() => {
     const params: { status: string; campaignId?: string } = { status: statusParam };
     if (filterCampaign) params.campaignId = filterCampaign;
-    history.list(params).then(setList).finally(() => setLoading(false));
+    history.replies(params).then(setList).finally(() => setLoading(false));
     campaigns.list().then(setCampaignsList).catch(console.error);
   }, [filterCampaign, statusParam]);
 
@@ -31,11 +31,11 @@ export default function Replies() {
     setLoading(true);
     const params: { status: string; campaignId?: string } = { status: statusParam };
     if (filterCampaign) params.campaignId = filterCampaign;
-    history.list(params).then(setList).finally(() => setLoading(false));
+    history.replies(params).then(setList).finally(() => setLoading(false));
   };
 
   const getTypeBadgeStyle = (status: string) => {
-    if (status === "replied") return { background: "#166534", color: "#fff" };
+    if (status === "replied" || status === "human") return { background: "#166534", color: "#fff" };
     if (status === "bounce") return { background: "#991b1b", color: "#fff" };
     if (status === "auto_reply") return { background: "#854d0e", color: "#fff" };
     return { background: "#374151", color: "#fff" };
@@ -45,7 +45,7 @@ export default function Replies() {
     <div>
       <h1 style={{ margin: "0 0 1.5rem", fontSize: "1.75rem" }}>Replies</h1>
       <p style={{ margin: "0 0 1rem", color: "#a1a1aa", fontSize: "0.875rem" }}>
-        All replies received to your cold emails. Human replies, bounces, and auto-replies are detected automatically.
+        All replies received to your cold emails. Each new reply from a lead appears as a row. Manual replies you send are marked as Answered.
       </p>
       <div style={{ marginBottom: "1rem", display: "flex", gap: "1rem", alignItems: "center", flexWrap: "wrap" }}>
         <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
@@ -98,60 +98,62 @@ export default function Replies() {
                 <th style={{ padding: "0.75rem 1rem", textAlign: "left", fontWeight: 600 }}>Campaign</th>
                 <th style={{ padding: "0.75rem 1rem", textAlign: "left", fontWeight: 600 }}>Account</th>
                 <th style={{ padding: "0.75rem 1rem", textAlign: "left", fontWeight: 600 }}>Type</th>
+                <th style={{ padding: "0.75rem 1rem", textAlign: "left", fontWeight: 600 }}>Answered</th>
                 <th style={{ padding: "0.75rem 1rem", textAlign: "left", fontWeight: 600 }}>Reply</th>
               </tr>
             </thead>
             <tbody>
-              {list.map((s) => (
-                <Fragment key={s.id}>
+              {list.map((r) => (
+                <Fragment key={r.id}>
                   <tr style={{ borderTop: "1px solid #27272a" }}>
                     <td style={{ padding: "0.75rem 1rem", fontSize: "0.875rem" }}>
-                      {s.replyAt ? (
-                        <>
-                          <span title="Reply received">{new Date(s.replyAt).toLocaleString()}</span>
-                          {s.sentAt && (
-                            <span style={{ color: "#71717a", fontSize: "0.75rem", display: "block", marginTop: "0.125rem" }}>
-                              sent {new Date(s.sentAt).toLocaleString()}
-                            </span>
-                          )}
-                        </>
-                      ) : (
-                        new Date(s.sentAt).toLocaleString()
+                      <span title="Reply received">{new Date(r.replyAt).toLocaleString()}</span>
+                      {r.sentEmail?.sentAt && (
+                        <span style={{ color: "#71717a", fontSize: "0.75rem", display: "block", marginTop: "0.125rem" }}>
+                          sent {new Date(r.sentEmail.sentAt).toLocaleString()}
+                        </span>
                       )}
                     </td>
-                    <td style={{ padding: "0.75rem 1rem" }}>{s.lead?.email ?? "—"}</td>
-                    <td style={{ padding: "0.75rem 1rem", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis" }}>{s.subject}</td>
+                    <td style={{ padding: "0.75rem 1rem" }}>{r.sentEmail?.lead?.email ?? "—"}</td>
+                    <td style={{ padding: "0.75rem 1rem", maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis" }}>{r.sentEmail?.subject ?? "—"}</td>
                     <td style={{ padding: "0.75rem 1rem", fontSize: "0.875rem" }}>
-                      {s.campaign ? (
-                        <Link to={`/campaigns/${s.campaign.id}`} style={{ color: "#a78bfa", textDecoration: "none" }}>
-                          {s.campaign.name}
+                      {r.sentEmail?.campaign ? (
+                        <Link to={`/campaigns/${r.sentEmail.campaign.id}`} style={{ color: "#a78bfa", textDecoration: "none" }}>
+                          {r.sentEmail.campaign.name}
                         </Link>
                       ) : (
                         "—"
                       )}
                     </td>
-                    <td style={{ padding: "0.75rem 1rem", fontSize: "0.875rem" }}>{s.account?.email ?? "—"}</td>
+                    <td style={{ padding: "0.75rem 1rem", fontSize: "0.875rem" }}>{r.sentEmail?.account?.email ?? "—"}</td>
                     <td style={{ padding: "0.75rem 1rem" }}>
                       <span
                         style={{
                           padding: "0.25rem 0.5rem",
                           borderRadius: 4,
                           fontSize: "0.875rem",
-                          ...getTypeBadgeStyle(s.status),
+                          ...getTypeBadgeStyle(r.replyType || "replied"),
                         }}
                       >
-                        {s.replyType || s.status}
+                        {r.replyType || "human"}
                       </span>
                     </td>
                     <td style={{ padding: "0.75rem 1rem" }}>
-                      {s.replyBody ? (
+                      {r.answered ? (
+                        <span style={{ color: "#22c55e", fontSize: "0.875rem" }}>Yes</span>
+                      ) : (
+                        <span style={{ color: "#71717a", fontSize: "0.875rem" }}>—</span>
+                      )}
+                    </td>
+                    <td style={{ padding: "0.75rem 1rem" }}>
+                      {r.replyBody ? (
                         <button
                           onClick={() => {
-                            if (expandedId === s.id) {
+                            if (expandedId === r.id) {
                               setExpandedId(null);
                               setFullHeightId(null);
                             } else {
-                              setExpandedId(s.id);
+                              setExpandedId(r.id);
                             }
                           }}
                           style={{
@@ -164,55 +166,55 @@ export default function Replies() {
                             fontSize: "0.875rem",
                           }}
                         >
-                          {expandedId === s.id ? "Hide" : "Show"}
+                          {expandedId === r.id ? "Hide" : "Show"}
                         </button>
-                      ) : s.replyAt ? (
+                      ) : (
                         <span style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
                           <span style={{ color: "#a78bfa", fontSize: "0.875rem" }} title="Reply detected but body not extracted.">
                             Body not extracted
                           </span>
-                          <button
-                            onClick={async () => {
-                              setRefreshingId(s.id);
-                              try {
-                                const r = await history.refreshReply(s.id);
-                                if (r.updated) refresh();
-                                else if (r.error) alert(r.error);
-                              } catch (e) {
-                                alert(e instanceof Error ? e.message : "Refresh failed");
-                              } finally {
-                                setRefreshingId(null);
-                              }
-                            }}
-                            disabled={refreshingId === s.id}
-                            style={{
-                              padding: "0.2rem 0.4rem",
-                              background: "#27272a",
-                              border: "1px solid #3f3f46",
-                              borderRadius: 4,
-                              color: "#a78bfa",
-                              cursor: refreshingId === s.id ? "not-allowed" : "pointer",
-                              fontSize: "0.75rem",
-                            }}
-                          >
-                            {refreshingId === s.id ? "..." : "Refresh"}
-                          </button>
+                          {r.sentEmailId && (
+                            <button
+                              onClick={async () => {
+                                setRefreshingId(r.sentEmailId);
+                                try {
+                                  const res = await history.refreshReply(r.sentEmailId);
+                                  if (res.updated) refresh();
+                                  else if (res.error) alert(res.error);
+                                } catch (e) {
+                                  alert(e instanceof Error ? e.message : "Refresh failed");
+                                } finally {
+                                  setRefreshingId(null);
+                                }
+                              }}
+                              disabled={refreshingId === r.sentEmailId}
+                              style={{
+                                padding: "0.2rem 0.4rem",
+                                background: "#27272a",
+                                border: "1px solid #3f3f46",
+                                borderRadius: 4,
+                                color: "#a78bfa",
+                                cursor: refreshingId === r.sentEmailId ? "not-allowed" : "pointer",
+                                fontSize: "0.75rem",
+                              }}
+                            >
+                              {refreshingId === r.sentEmailId ? "..." : "Refresh"}
+                            </button>
+                          )}
                         </span>
-                      ) : (
-                        <span style={{ color: "#71717a", fontSize: "0.875rem" }}>—</span>
                       )}
                     </td>
                   </tr>
-                  {expandedId === s.id && s.replyBody && (
+                  {expandedId === r.id && r.replyBody && (
                     <tr style={{ borderTop: "none", background: "#0f0f10" }}>
-                      <td colSpan={7} style={{ padding: "1rem 1rem 1.5rem", borderTop: "1px solid #27272a" }}>
+                      <td colSpan={8} style={{ padding: "1rem 1rem 1.5rem", borderTop: "1px solid #27272a" }}>
                         <div
                           style={{
                             whiteSpace: "pre-wrap",
                             fontFamily: "monospace",
                             fontSize: "0.8125rem",
                             color: "#d4d4d8",
-                            maxHeight: fullHeightId === s.id ? "none" : 500,
+                            maxHeight: fullHeightId === r.id ? "none" : 500,
                             overflow: "auto",
                             padding: "1rem",
                             background: "#18181b",
@@ -220,10 +222,10 @@ export default function Replies() {
                             border: "1px solid #27272a",
                           }}
                         >
-                          {s.replyBody}
+                          {r.replyBody}
                         </div>
                         <button
-                          onClick={() => setFullHeightId(fullHeightId === s.id ? null : s.id)}
+                          onClick={() => setFullHeightId(fullHeightId === r.id ? null : r.id)}
                           style={{
                             marginTop: "0.5rem",
                             padding: "0.25rem 0.5rem",
@@ -235,7 +237,7 @@ export default function Replies() {
                             fontSize: "0.8125rem",
                           }}
                         >
-                          {fullHeightId === s.id ? "Collapse" : "Expand"}
+                          {fullHeightId === r.id ? "Collapse" : "Expand"}
                         </button>
                       </td>
                     </tr>

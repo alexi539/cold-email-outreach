@@ -105,10 +105,24 @@ export const leads = {
     }),
 };
 
+export interface ReplyMessage {
+  id: string;
+  sentEmailId: string;
+  replyAt: string;
+  replyBody: string | null;
+  replyType: string | null;
+  fromUs: boolean;
+  sentEmail: SentEmail;
+}
+
 export const history = {
   list: (params?: { campaignId?: string; accountId?: string; status?: string }) => {
     const q = new URLSearchParams(params as Record<string, string>).toString();
     return fetchApi<SentEmail[]>(`/history${q ? `?${q}` : ""}`);
+  },
+  replies: (params?: { campaignId?: string; accountId?: string; status?: string }) => {
+    const q = new URLSearchParams(params as Record<string, string>).toString();
+    return fetchApi<ReplyMessage[]>(`/history/replies${q ? `?${q}` : ""}`);
   },
   refreshReply: (id: string) =>
     fetchApi<{ updated: boolean; error?: string }>(`/history/${id}/refresh-reply`, { method: "POST" }),

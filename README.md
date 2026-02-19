@@ -478,6 +478,23 @@ All backend logs go to **stdout** (console). When running `npm run dev`, logs ap
 
 ## 14. Changelog
 
+### 2026-02-19 (follow-up 4) — Full reply chain (Gmail + Zoho)
+
+**Reply chain support:**
+- New `ReplyMessage` model — each message in a thread (from lead or from us)
+- Gmail: process ALL messages in thread, not just first reply; detect manual replies (fromUs)
+- Zoho: process ALL matching emails; detect fromUs via From header
+- Each new reply from lead = new row in Replies tab
+- "Answered" badge when user manually replied after the lead's message
+
+**API:**
+- `GET /api/history/replies` — returns ReplyMessage[] (from lead only), sorted by replyAt desc
+
+**UI (Replies tab):**
+- Uses new replies API; each row = one reply from lead
+- Answered column shows if user replied manually
+- Latest replies at top
+
 ### 2026-02-19 (follow-up 3) — GitHub + Railway deploy
 
 **Production deploy:**

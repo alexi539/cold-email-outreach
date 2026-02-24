@@ -128,6 +128,75 @@ export const history = {
     fetchApi<{ updated: boolean; error?: string }>(`/history/${id}/refresh-reply`, { method: "POST" }),
 };
 
+export interface InboxMessageListItem {
+  id: string;
+  accountId: string;
+  accountEmail: string;
+  accountType: "google" | "zoho";
+  threadId?: string;
+  from: string;
+  to: string;
+  subject: string;
+  date: string;
+  snippet: string;
+  unread: boolean;
+}
+
+export interface InboxMessageFull extends InboxMessageListItem {
+  body: string;
+  messageId?: string;
+  inReplyTo?: string;
+  references?: string;
+  sentEmail?: {
+    id: string;
+    campaignId: string;
+    campaign?: { name: string };
+    lead?: { email: string };
+  };
+}
+
+export interface InboxThreadMessage {
+  id: string;
+  from: string;
+  to: string;
+  subject: string;
+  date: string;
+  body: string;
+  messageId?: string;
+  isFromUs?: boolean;
+}
+
+export interface InboxThreadResponse {
+  messages: InboxThreadMessage[];
+  accountId: string;
+  accountEmail: string;
+}
+
+export const inbox = {
+  list: (accountId: string, params?: { limit?: number; pageToken?: string }) => {
+    const q = new URLSearchParams({ accountId });
+    if (params?.limit) q.set("limit", String(params.limit));
+    if (params?.pageToken) q.set("pageToken", params.pageToken);
+    return fetchApi<{ messages: InboxMessageListItem[]; nextPageToken?: string }>(`/inbox?${q}`);
+  },
+  listAll: (params?: { limit?: number; pageToken?: string }) => {
+    const q = new URLSearchParams();
+    if (params?.limit) q.set("limit", String(params.limit));
+    if (params?.pageToken) q.set("pageToken", params.pageToken);
+    return fetchApi<{ messages: InboxMessageListItem[]; nextPageToken?: string }>(`/inbox/all?${q}`);
+  },
+  getMessage: (accountId: string, messageId: string) =>
+    fetchApi<InboxMessageFull>(`/inbox/${accountId}/messages/${encodeURIComponent(messageId)}`),
+  getThread: (accountId: string, messageId: string) =>
+    fetchApi<InboxThreadResponse>(`/inbox/${accountId}/thread/${encodeURIComponent(messageId)}`),
+  unreadCount: (accountId?: string) => {
+    const q = accountId ? `?accountId=${encodeURIComponent(accountId)}` : "";
+    return fetchApi<{ total: number; byAccount?: Record<string, number> }>(`/inbox/unread-count${q}`);
+  },
+  sendReply: (data: { accountId: string; messageId: string; to: string; subject: string; body: string }) =>
+    fetchApi<{ success: boolean }>("/inbox/send-reply", { method: "POST", body: JSON.stringify(data) }),
+};
+
 export const stats = {
   dashboard: () => fetchApi<{ campaigns: number; accounts: number; totalSent: number; totalReplied: number }>("/stats/dashboard"),
 };

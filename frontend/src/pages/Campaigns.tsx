@@ -25,8 +25,8 @@ export default function Campaigns() {
         name,
         dailyLimit: 500,
         startTime: null,
-        workingHoursStart: "09:00",
-        workingHoursEnd: "18:00",
+        workingHoursStart: "16:00",
+        workingHoursEnd: "01:00",
         accountIds: [],
         sequence: {
           throttleMinMinutes: 2,

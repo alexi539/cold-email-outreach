@@ -11,6 +11,7 @@ import { authRouter } from "./routes/auth.js";
 import { campaignsRouter } from "./routes/campaigns.js";
 import { leadsRouter, handleLeadsUpload } from "./routes/leads.js";
 import { historyRouter } from "./routes/history.js";
+import { inboxRouter } from "./routes/inbox.js";
 import { statsRouter } from "./routes/stats.js";
 import { runSendCycle } from "./services/scheduler.js";
 import { checkReplies } from "./services/replyChecker.js";
@@ -32,6 +33,7 @@ app.use("/api/campaigns", campaignsRouter);
 app.post("/api/leads/upload", upload.single("file"), handleLeadsUpload);
 app.use("/api/leads", leadsRouter);
 app.use("/api/history", historyRouter);
+app.use("/api/inbox", inboxRouter);
 app.use("/api/stats", statsRouter);
 
 app.get("/api/health", (_req, res) => res.json({ ok: true }));

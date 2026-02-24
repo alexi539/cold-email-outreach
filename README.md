@@ -15,7 +15,8 @@ A **single-user web application** for cold email outreach. It allows the user to
 - Upload leads via CSV with dynamic column-based personalization
 - Send emails with configurable limits, throttling (per account), and working hours
 - Track sent emails and detect replies automatically (human, bounce, auto-reply)
-- View all replies with full text in a dedicated **Replies** tab
+- View **Inbox** — all incoming messages from all accounts, with reply-from-app
+- Unread count badge on Inbox in navigation
 - Follow-ups sent as replies in the same thread (In-Reply-To / References)
 
 ### Target user
@@ -146,13 +147,16 @@ Optional: validate emails before upload to reduce bounce rate. Uses [ValidKit](h
 │   │   │   ├── accounts.ts
 │   │   │   ├── validateCampaign.ts
 │   │   │   ├── replyType.ts      # Bounce/auto-reply detection
-│   │   │   └── gmailBody.ts      # Gmail body extraction (recursive multipart, attachmentId, charset)
+│   │   │   ├── spamFilter.ts     # Spam tracking code filter (subject/body end)
+│   │   │   ├── gmailBody.ts      # Gmail body extraction (recursive multipart, attachmentId, charset)
+│   │   │   └── zohoBody.ts       # Zoho raw MIME body extraction (shared by replyChecker, inbox)
 │   │   ├── routes/
 │   │   │   ├── accounts.ts
 │   │   │   ├── auth.ts
 │   │   │   ├── campaigns.ts
 │   │   │   ├── leads.ts
 │   │   │   ├── history.ts
+│   │   │   ├── inbox.ts          # Inbox list, message fetch, unread count, send reply
 │   │   │   └── stats.ts
 │   │   └── services/
 │   │       ├── gmail.ts
@@ -161,6 +165,7 @@ Optional: validate emails before upload to reduce bounce rate. Uses [ValidKit](h
 │   │       ├── personalize.ts
 │   │       ├── scheduler.ts
 │   │       ├── replyChecker.ts  # Gmail/Zoho reply detection, re-check empty body, batch limit
+│   │       ├── inbox.ts         # Inbox service: Gmail API + Zoho IMAP list, get, unread, send reply
 │   │       ├── campaignStart.ts
 │   │       └── campaignCompletion.ts
 │   ├── validated-backups/       # JSON backups of ValidKit validation results (created on first validation)
@@ -182,7 +187,7 @@ Optional: validate emails before upload to reduce bounce rate. Uses [ValidKit](h
     │       ├── Campaigns.tsx
     │       ├── CampaignEdit.tsx
     │       ├── History.tsx
-    │       ├── Replies.tsx
+    │       ├── Inbox.tsx        # Inbox: list, thread view, unified/all accounts, reply composer
     │       └── AuthCallback.tsx
     ├── index.html
     ├── vite.config.ts
@@ -240,6 +245,8 @@ Optional: validate emails before upload to reduce bounce rate. Uses [ValidKit](h
 - **replyAt** — when the reply was received
 - **replyType** — human | bounce | auto_reply (detected from content + timing)
 
+**Inbox:** No DB model. Messages are fetched live from Gmail API (`messages.list`, `messages.get`, `threads.get`) and Zoho IMAP (INBOX). **Unified inbox** merges messages from all active accounts, sorted by date. **Spam filter** hides messages with tracking codes (e.g. `Z5X6C8Y 7M96V9D`) at end of subject or body. **Thread view** shows full conversation (Gmail: native threads; Zoho: References/In-Reply-To grouping). Campaign linking is optional metadata when a message matches a SentEmail thread.
+
 ### ValidKitKeyUsage
 
 - keyIndex, keyLabel (last 8 chars for display)
@@ -261,7 +268,7 @@ Optional: validate emails before upload to reduce bounce rate. Uses [ValidKit](h
 - **Dashboard** — stats, campaign list
 - **Email Accounts** — Gmail (OAuth) and Zoho
 - **Campaigns** — create, list, edit
-- **Replies** — all replies (human, bounce, auto-reply) with full text; filter by campaign and type; expand to read reply body; Expand/Collapse for long replies; "Body not extracted" + Refresh button when body missing
+- **Inbox** — all incoming messages; **All accounts** or per-account selector; list + **thread view** (full conversation); reply composer with **Reply from** selector (default = account that received the email); unread count badge in nav
 - **History** — all sent emails with status
 
 ### Campaign Edit — Tabs
@@ -316,6 +323,16 @@ Optional: validate emails before upload to reduce bounce rate. Uses [ValidKit](h
 - **Bounce/auto-reply detection:** Replies are classified as **human**, **bounce** (delivery failed, user unknown, etc.), or **auto_reply** (out of office, vacation, etc.). Fast replies (&lt; 5 min) without clear human content → auto_reply. Bounce/auto_reply leads stop receiving follow-ups.
 - **Pause:** Manual or auto when campaign/account limits reached
 - **Paused campaign protection:** Paused campaigns are never auto-changed to "finished". Only **active** campaigns auto-finish when all leads are done. You control when to resume or finish a paused campaign.
+- **Inbox:** Fetches all INBOX messages from Gmail (API) and Zoho (IMAP). No local storage. **Spam filter** hides messages with alphanumeric tracking codes at end of subject or body. **Unified inbox** merges all accounts; **thread view** shows full conversation (Gmail: `threads.get`; Zoho: References/In-Reply-To grouping). Reply sends via Gmail API or Zoho SMTP with In-Reply-To/References. **Reply from** defaults to the account that received the email; user can switch to another account. Campaign badge when message matches a campaign thread.
+
+### Inbox API
+
+- `GET /api/inbox?accountId=&limit=50&pageToken=` — list messages (accountId required)
+- `GET /api/inbox/all?limit=50&pageToken=` — unified inbox (all accounts)
+- `GET /api/inbox/:accountId/messages/:messageId` — full message (messageId = Gmail id or `zoho:{accountId}:{uid}`)
+- `GET /api/inbox/:accountId/thread/:messageId` — full thread (all messages in conversation)
+- `GET /api/inbox/unread-count?accountId=` — unread count (all accounts if no accountId)
+- `POST /api/inbox/send-reply` — send reply (body: accountId, messageId, to, subject, body)
 
 ---
 
@@ -387,6 +404,12 @@ All backend logs go to **stdout** (console). When running `npm run dev`, logs ap
 | Reply found but body empty | `Reply found but body empty` | sentEmailId, gmailMessageId, partsStructure |
 | Reply check failed for thread | `Reply check failed for thread` | sentEmailId, gmailThreadId, error |
 | Reply check crash | `Reply check error` | message, stack |
+| Inbox list | `Inbox list` | accountId, count |
+| Inbox unified list | `Inbox unified list` | count |
+| Inbox message fetch | `Inbox message fetch` | accountId, messageId/uid |
+| Inbox thread fetch | `Inbox thread fetch` | accountId, threadId/uid, count |
+| Inbox unread count | `Inbox unread count` | total, byAccount |
+| Inbox reply sent | `Inbox reply sent` | accountId, to |
 
 ### Campaign skip reasons (INFO)
 
@@ -420,7 +443,7 @@ All backend logs go to **stdout** (console). When running `npm run dev`, logs ap
 - **Logs:** Terminal where backend runs, or redirect stdout to a file: `npm run dev 2>&1 | tee backend.log`
 - **Sent emails:** History tab in UI, or `SentEmail` table in DB
 - **Lead status:** Campaign Edit → Leads tab (pending / sent / replied / bounce / auto_reply)
-- **Replies:** Replies tab — view all replies with full text; filter by campaign and type; expand row, Expand/Collapse for long replies; Refresh button when body not extracted
+- **Inbox:** Inbox tab — select account, view all messages, reply from app; unread badge in nav
 
 ---
 
@@ -477,6 +500,52 @@ All backend logs go to **stdout** (console). When running `npm run dev`, logs ap
 ---
 
 ## 14. Changelog
+
+### 2026-02-24 (follow-up) — Spam filter, thread view, unified inbox
+
+**Spam filter:**
+- New `backend/src/lib/spamFilter.ts` — detects tracking codes (e.g. `Z5X6C8Y`, `Z5X6C8Y 7M96V9D`) at end of subject or body
+- Filtered messages are hidden from list and thread view (Gmail + Zoho)
+
+**Thread view:**
+- Clicking a message now shows the **full thread** (all replies in the conversation)
+- Gmail: uses `threads.get` API
+- Zoho: groups by References/In-Reply-To (fetches last 300 messages from INBOX)
+- Messages marked as "You" when from our account
+
+**Unified inbox:**
+- New "All accounts" option — merges messages from all active accounts, sorted by date
+- In unified list, each message shows its account email
+- **Reply from** defaults to the account that received the email; selector to change when multiple accounts
+
+**API:**
+- `GET /api/inbox/all` — unified inbox list
+- `GET /api/inbox/:accountId/thread/:messageId` — full thread
+
+### 2026-02-24 — Inbox replaces Replies
+
+**Inbox feature:**
+- Replaced Replies tab with unified Inbox
+- Fetches all inbox messages from Gmail (API) and Zoho (IMAP)
+- Full message view with reply composer (In-Reply-To, References for threading)
+- Unread count badge on Inbox nav item
+- Campaign badge when message is linked to a campaign thread
+
+**API:**
+- `GET /api/inbox` — list messages (accountId required)
+- `GET /api/inbox/:accountId/messages/:messageId` — full message
+- `GET /api/inbox/unread-count` — unread count
+- `POST /api/inbox/send-reply` — send reply
+
+**Backend:**
+- New `inbox.ts` service (Gmail + Zoho)
+- New `inbox` router
+- New `zohoBody.ts` lib (extractZohoBodyFromRaw shared with replyChecker)
+
+**Frontend:**
+- New Inbox page (list, detail, reply composer)
+- Nav: Replies → Inbox with unread badge
+- Redirect `/replies` → `/inbox`
 
 ### 2026-02-19 (follow-up 4) — Full reply chain (Gmail + Zoho)
 

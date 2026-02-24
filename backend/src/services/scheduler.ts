@@ -8,10 +8,6 @@ import { personalize } from "./personalize.js";
 import { stripHtml } from "../lib/emailBody.js";
 import { humanLikeThrottleSeconds } from "../lib/throttle.js";
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
 async function maybeResetAccountLimit(account: { id: string; limitResetAt: Date | null; sentToday: number; dailyLimit: number }) {
   if (!account.limitResetAt) return;
   if (new Date() >= account.limitResetAt) {
@@ -40,8 +36,8 @@ export async function runSendCycle() {
       continue;
     }
 
-    const workingHoursStart = campaign.workingHoursStart || "09:00";
-    const workingHoursEnd = campaign.workingHoursEnd || "18:00";
+    const workingHoursStart = campaign.workingHoursStart || "16:00";
+    const workingHoursEnd = campaign.workingHoursEnd || "01:00";
     if (!isWithinWorkingHours(workingHoursStart, workingHoursEnd, now)) {
       logger.info("Campaign skipped: outside working hours", {
         campaignId: campaign.id,
@@ -214,35 +210,30 @@ export async function runSendCycle() {
         const throttleMax = campaign.sequence.throttleMaxMinutes ?? 5;
         const randomSeconds = humanLikeThrottleSeconds(throttleMin, throttleMax);
         const throttleMs = randomSeconds * 1000;
+        const minNextSendAt = now.getTime() + throttleMs;
 
-        const nextLeadSameAccount = await prisma.lead.findFirst({
+        // Stagger all "ready" leads for this account to prevent burst on resume
+        const readyLeadsSameAccount = await prisma.lead.findMany({
           where: {
             campaignId: campaign.id,
             assignedAccountId: account.id,
             status: { in: ["pending", "sent"] },
-            nextSendAt: { not: null },
+            nextSendAt: { lt: new Date(minNextSendAt), not: null },
             id: { not: lead.id },
           },
           orderBy: { nextSendAt: "asc" },
         });
-        if (nextLeadSameAccount) {
-          const currentNext = nextLeadSameAccount.nextSendAt ? nextLeadSameAccount.nextSendAt.getTime() : 0;
-          const proposed = now.getTime() + throttleMs;
-          if (proposed > currentNext) {
-            await prisma.lead.update({
-              where: { id: nextLeadSameAccount.id },
-              data: { nextSendAt: new Date(proposed) },
-            });
-          }
+        for (let i = 0; i < readyLeadsSameAccount.length; i++) {
+          const staggeredAt = new Date(now.getTime() + (i + 1) * throttleMs);
+          await prisma.lead.update({
+            where: { id: readyLeadsSameAccount[i]!.id },
+            data: { nextSendAt: staggeredAt },
+          });
         }
 
         campaignSentToday++;
         sentThisRun++;
         logger.info("Sent email", { leadId: lead.id, to: lead.email, step: stepIndex });
-
-        // Real delay between sends — throttle is always respected
-        await sleep(throttleMs);
-        logger.info("Throttle delay complete", { throttleSeconds: Math.round(throttleMs / 1000) });
 
         updateCampaignStatusFromCompletion(campaign.id).catch((e) =>
           logger.error("Campaign completion check error", {

@@ -24,8 +24,8 @@ export default function CampaignEdit() {
     dailyLimit: 500,
     startImmediately: false,
     startTime: "09:00",
-    workingHoursStart: "09:00",
-    workingHoursEnd: "18:00",
+    workingHoursStart: "16:00",
+    workingHoursEnd: "01:00",
     accountIds: [] as string[],
     throttleMin: 2,
     throttleMax: 5,
@@ -44,8 +44,8 @@ export default function CampaignEdit() {
           dailyLimit: c.dailyLimit,
           startImmediately: !c.startTime || c.startTime === "",
           startTime: c.startTime || "09:00",
-          workingHoursStart: c.workingHoursStart || "09:00",
-          workingHoursEnd: c.workingHoursEnd || "18:00",
+          workingHoursStart: c.workingHoursStart || "16:00",
+          workingHoursEnd: c.workingHoursEnd || "01:00",
           accountIds: c.campaignAccounts?.map((ca) => ca.account.id) ?? [],
           throttleMin: c.sequence?.throttleMinMinutes ?? 2,
           throttleMax: c.sequence?.throttleMaxMinutes ?? 5,
@@ -313,7 +313,7 @@ export default function CampaignEdit() {
                   type="text"
                   value={form.workingHoursStart}
                   onChange={(e) => setForm({ ...form, workingHoursStart: e.target.value })}
-                  placeholder="09:00"
+                  placeholder="16:00"
                   style={{ width: 70, padding: "0.5rem", background: "#27272a", border: "1px solid #3f3f46", borderRadius: 6, color: "#e4e4e7" }}
                 />
                 —
@@ -321,12 +321,12 @@ export default function CampaignEdit() {
                   type="text"
                   value={form.workingHoursEnd}
                   onChange={(e) => setForm({ ...form, workingHoursEnd: e.target.value })}
-                  placeholder="18:00"
+                  placeholder="01:00"
                   style={{ width: 70, padding: "0.5rem", marginLeft: "0.25rem", background: "#27272a", border: "1px solid #3f3f46", borderRadius: 6, color: "#e4e4e7" }}
                 />
               </span>
               <p style={{ margin: "0.25rem 0 0", fontSize: "0.75rem", color: "#71717a" }}>
-                Overnight range supported: 09:00–03:00 = 9 AM to 3 AM next day
+                Overnight range supported: 16:00–01:00 = 4 PM to 1 AM next day
               </p>
               {(campaign?.status === "active" || campaign?.status === "paused") && (
                 <p style={{ margin: "0.5rem 0 0", fontSize: "0.75rem", color: "#a78bfa" }}>

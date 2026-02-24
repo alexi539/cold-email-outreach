@@ -61,8 +61,8 @@ router.post("/", async (req, res) => {
       name,
       dailyLimit,
       startTime,
-      workingHoursStart = "09:00",
-      workingHoursEnd = "18:00",
+      workingHoursStart = "16:00",
+      workingHoursEnd = "01:00",
       accountIds = [],
       sequence,
     } = req.body;
@@ -83,8 +83,8 @@ router.post("/", async (req, res) => {
         name: (name && String(name).trim()) || "Untitled Campaign",
         dailyLimit: Number(dailyLimit) || 500,
         startTime: startTime || null,
-        workingHoursStart: String(workingHoursStart || "09:00"),
-        workingHoursEnd: String(workingHoursEnd || "18:00"),
+        workingHoursStart: String(workingHoursStart || "16:00"),
+        workingHoursEnd: String(workingHoursEnd || "01:00"),
         campaignAccounts: accountIds.length
           ? { create: accountIds.map((aid: string) => ({ accountId: aid })) }
           : undefined,

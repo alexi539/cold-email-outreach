@@ -32,8 +32,8 @@ model Campaign {
   dailyLimit          Int      @map("daily_limit")
   status              String   @default("draft") // draft | active | paused | finished
   startTime           String?  @map("start_time") // HH:mm MSK
-  workingHoursStart   String   @default("09:00") @map("working_hours_start")
-  workingHoursEnd     String   @default("18:00") @map("working_hours_end")
+  workingHoursStart   String   @default("16:00") @map("working_hours_start")
+  workingHoursEnd     String   @default("01:00") @map("working_hours_end")
   createdAt           DateTime @default(now()) @map("created_at")
 
   campaignAccounts CampaignAccount[]

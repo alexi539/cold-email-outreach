@@ -1,13 +1,35 @@
+import { useEffect, useState } from "react";
 import { Routes, Route, NavLink, Navigate } from "react-router-dom";
 import Dashboard from "./pages/Dashboard";
 import Accounts from "./pages/Accounts";
 import Campaigns from "./pages/Campaigns";
 import CampaignEdit from "./pages/CampaignEdit";
 import History from "./pages/History";
-import Replies from "./pages/Replies";
+import Inbox from "./pages/Inbox";
 import AuthCallback from "./pages/AuthCallback";
+import { inbox } from "./api";
 
 function App() {
+  const [unreadCount, setUnreadCount] = useState(0);
+
+  const fetchUnread = () => {
+    inbox.unreadCount().then((r) => setUnreadCount(r.total)).catch(() => setUnreadCount(0));
+  };
+
+  useEffect(() => {
+    fetchUnread();
+    const interval = setInterval(fetchUnread, 120000);
+    const onFocus = () => fetchUnread();
+    const onInboxUpdate = () => fetchUnread();
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("inbox-update", onInboxUpdate);
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("inbox-update", onInboxUpdate);
+    };
+  }, []);
+
   return (
     <div style={{ display: "flex", minHeight: "100vh" }}>
       <nav style={{
@@ -53,15 +75,31 @@ function App() {
           Campaigns
         </NavLink>
         <NavLink
-          to="/replies"
+          to="/inbox"
           style={({ isActive }) => ({
-            display: "block",
+            display: "flex",
+            alignItems: "center",
             padding: "0.5rem 1rem",
             color: isActive ? "#a78bfa" : "#a1a1aa",
             fontWeight: isActive ? 600 : 400,
           })}
         >
-          Replies
+          Inbox
+          {unreadCount > 0 && (
+            <span
+              style={{
+                marginLeft: 6,
+                background: "#a78bfa",
+                color: "#fff",
+                borderRadius: 10,
+                padding: "2px 6px",
+                fontSize: 11,
+                fontWeight: 600,
+              }}
+            >
+              {unreadCount > 99 ? "99+" : unreadCount}
+            </span>
+          )}
         </NavLink>
         <NavLink
           to="/history"
@@ -82,7 +120,8 @@ function App() {
           <Route path="/campaigns" element={<Campaigns />} />
           <Route path="/campaigns/:id" element={<CampaignEdit />} />
           <Route path="/campaigns/new" element={<Navigate to="/campaigns" replace state={{ create: true }} />} />
-          <Route path="/replies" element={<Replies />} />
+          <Route path="/inbox" element={<Inbox />} />
+          <Route path="/replies" element={<Navigate to="/inbox" replace />} />
           <Route path="/history" element={<History />} />
           <Route path="/auth/callback" element={<AuthCallback />} />
         </Routes>

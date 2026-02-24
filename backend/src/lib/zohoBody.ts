@@ -1,7 +1,11 @@
 /**
  * Extract plain text body from raw MIME message (Zoho IMAP).
- * Recursive for nested multipart. Shared by replyChecker and inbox.
+ * Uses mailparser for robust parsing; falls back to custom parser on failure.
+ * Shared by replyChecker and inbox.
  */
+
+import { simpleParser } from "mailparser";
+import { stripHtml } from "./emailBody.js";
 
 function parsePartCharset(headersSection: string): BufferEncoding {
   const match = headersSection.match(/charset\s*=\s*["']?([^"'\s;]+)/i);
@@ -37,8 +41,8 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Extract plain text body from raw MIME message (recursive for nested multipart) */
-export function extractZohoBodyFromRaw(raw: string): string {
+/** Legacy fallback: extract plain text from raw MIME (recursive for nested multipart) */
+function extractZohoBodyFromRawLegacy(raw: string): string {
   const parts = raw.split(/\r?\n\r?\n/);
   if (parts.length < 2) return "";
   const headers = parts[0].toLowerCase();
@@ -65,7 +69,7 @@ export function extractZohoBodyFromRaw(raw: string): string {
     const subBodyRaw = subParts[1].split(boundaryDelim)[0].trim();
     if (subHeaders.includes("multipart/")) {
       const nestedRaw = subParts[0] + "\n\n" + subParts[1];
-      const nested = extractZohoBodyFromRaw(nestedRaw);
+      const nested = extractZohoBodyFromRawLegacy(nestedRaw);
       if (nested) {
         text = nested;
         break;
@@ -81,4 +85,28 @@ export function extractZohoBodyFromRaw(raw: string): string {
     }
   }
   return text;
+}
+
+/**
+ * Extract plain text body from raw MIME message (async).
+ * Uses mailparser for robust multipart parsing; falls back to legacy parser on failure.
+ */
+export async function extractZohoBodyFromRaw(raw: string): Promise<string> {
+  if (!raw?.trim()) return "";
+  try {
+    const buffer = Buffer.isBuffer(raw) ? raw : Buffer.from(raw, "utf-8");
+    const parsed = await simpleParser(buffer);
+    const text = typeof parsed.text === "string" ? parsed.text.trim() : "";
+    if (text) return text;
+    const html = typeof parsed.html === "string" ? parsed.html.trim() : "";
+    if (html) return stripHtml(html);
+  } catch {
+    // Fall through to legacy parser
+  }
+  return extractZohoBodyFromRawLegacy(raw);
+}
+
+/** Sync version for backward compatibility - uses legacy parser only. Prefer extractZohoBodyFromRaw (async). */
+export function extractZohoBodyFromRawSync(raw: string): string {
+  return extractZohoBodyFromRawLegacy(raw);
 }

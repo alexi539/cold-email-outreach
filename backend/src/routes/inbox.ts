@@ -18,7 +18,7 @@ router.get("/", async (req, res) => {
       return res.status(400).json({ error: "accountId required" });
     }
     const result = await listInboxMessages(accountId, {
-      limit: limit ? Math.min(Number(limit), 100) : undefined,
+      limit: limit ? Math.min(Number(limit), 200) : undefined,
       pageToken: typeof pageToken === "string" ? pageToken : undefined,
     });
     res.json(result);
@@ -39,7 +39,7 @@ router.get("/all", async (req, res) => {
   try {
     const { limit, pageToken } = req.query;
     const result = await listUnifiedInbox({
-      limit: limit ? Math.min(Number(limit), 100) : undefined,
+      limit: limit ? Math.min(Number(limit), 200) : undefined,
       pageToken: typeof pageToken === "string" ? pageToken : undefined,
     });
     res.json(result);

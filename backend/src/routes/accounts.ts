@@ -101,8 +101,56 @@ router.patch("/:id", async (req, res) => {
 });
 
 router.delete("/:id", async (req, res) => {
+  const accountId = req.params.id;
   try {
-    await prisma.emailAccount.delete({ where: { id: req.params.id } });
+    const account = await prisma.emailAccount.findUnique({ where: { id: accountId } });
+    if (!account) {
+      return res.status(404).json({ error: "Account not found" });
+    }
+
+    const leads = await prisma.lead.findMany({
+      where: { assignedAccountId: accountId },
+      include: { campaign: { include: { campaignAccounts: true } } },
+    });
+
+    const byCampaign = new Map<string, typeof leads>();
+    for (const lead of leads) {
+      const cid = lead.campaignId;
+      if (!byCampaign.has(cid)) byCampaign.set(cid, []);
+      byCampaign.get(cid)!.push(lead);
+    }
+
+    for (const [, campaignLeads] of byCampaign) {
+      const campaign = campaignLeads[0]!.campaign;
+      const otherAccounts = campaign.campaignAccounts
+        .filter((ca) => ca.accountId !== accountId)
+        .map((ca) => ca.accountId);
+
+      if (otherAccounts.length > 0) {
+        let idx = 0;
+        for (const lead of campaignLeads) {
+          const newAccountId = otherAccounts[idx % otherAccounts.length];
+          idx++;
+          await prisma.lead.update({
+            where: { id: lead.id },
+            data: { assignedAccountId: newAccountId },
+          });
+        }
+      } else {
+        await prisma.lead.updateMany({
+          where: { id: { in: campaignLeads.map((l) => l.id) } },
+          data: { assignedAccountId: null, nextSendAt: null },
+        });
+      }
+    }
+
+    await prisma.campaignAccount.deleteMany({ where: { accountId } });
+    await prisma.sentEmail.updateMany({
+      where: { accountId },
+      data: { accountId: null },
+    });
+    await prisma.emailAccount.delete({ where: { id: accountId } });
+
     res.status(204).send();
   } catch (e) {
     logger.error("Delete account error", e);

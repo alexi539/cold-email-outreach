@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Routes, Route, NavLink, Navigate } from "react-router-dom";
+import { InboxProvider } from "./contexts/InboxContext";
 import Dashboard from "./pages/Dashboard";
 import Accounts from "./pages/Accounts";
 import Campaigns from "./pages/Campaigns";
@@ -31,6 +32,7 @@ function App() {
   }, []);
 
   return (
+    <InboxProvider>
     <div style={{ display: "flex", minHeight: "100vh" }}>
       <nav style={{
         width: 220,
@@ -127,6 +129,7 @@ function App() {
         </Routes>
       </main>
     </div>
+    </InboxProvider>
   );
 }
 

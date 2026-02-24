@@ -55,7 +55,33 @@ export interface InboxThreadResponse {
 }
 
 const DEFAULT_LIMIT = 50;
-const GMAIL_REQUEST_DELAY_MS = 50;
+const GMAIL_REQUEST_DELAY_MS = 25;
+
+const IMAP_BASE_OPTIONS = { connTimeout: 30000, authTimeout: 15000 };
+
+const UNREAD_CACHE_TTL_MS = 60_000;
+const unreadCache = new Map<
+  string,
+  { value: { total: number; byAccount?: Record<string, number> }; expiresAt: number }
+>();
+
+async function withImapRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
+  let lastErr: Error | undefined;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e instanceof Error ? e : new Error(String(e));
+      const err = e as NodeJS.ErrnoException;
+      const isECONNRESET =
+        err?.code === "ECONNRESET" ||
+        (e instanceof Error && e.message.includes("ECONNRESET"));
+      if (!isECONNRESET || attempt === maxRetries) throw lastErr;
+      await new Promise((r) => setTimeout(r, 1000 + attempt * 1000));
+    }
+  }
+  throw lastErr;
+}
 
 function getHeader(payload: gmail_v1.Schema$MessagePart | undefined, name: string): string {
   const h = payload?.headers?.find((x) => x.name?.toLowerCase() === name.toLowerCase());
@@ -139,7 +165,7 @@ export async function listUnifiedInbox(
     return { messages: [] };
   }
 
-  const limit = Math.min(opts?.limit ?? DEFAULT_LIMIT, 100);
+  const limit = Math.min(opts?.limit ?? DEFAULT_LIMIT, 200);
   let cursor: Record<string, string> = {};
   try {
     if (opts?.pageToken) {
@@ -149,7 +175,7 @@ export async function listUnifiedInbox(
     cursor = {};
   }
 
-  const results = await Promise.all(
+  const results = await Promise.allSettled(
     accounts.map((acc) =>
       listInboxMessages(acc.id, {
         limit,
@@ -161,9 +187,17 @@ export async function listUnifiedInbox(
   const merged: InboxMessageListItem[] = [];
   const nextTokens: Record<string, string> = {};
   for (let i = 0; i < accounts.length; i++) {
-    merged.push(...results[i].messages);
-    if (results[i].nextPageToken) {
-      nextTokens[accounts[i].id] = results[i].nextPageToken!;
+    const r = results[i];
+    if (r.status === "fulfilled") {
+      merged.push(...r.value.messages);
+      if (r.value.nextPageToken) {
+        nextTokens[accounts[i].id] = r.value.nextPageToken;
+      }
+    } else {
+      logger.warn("Inbox unified list: account failed", {
+        accountId: accounts[i].id,
+        error: formatError(r.reason),
+      });
     }
   }
 
@@ -188,13 +222,13 @@ export async function listInboxMessages(
   });
   if (!account) throw new Error("Account not found");
 
-  const limit = Math.min(opts?.limit ?? DEFAULT_LIMIT, 100);
+  const limit = Math.min(opts?.limit ?? DEFAULT_LIMIT, 200);
 
   if (account.accountType === "google") {
     return listGmailInbox(account, limit, opts?.pageToken);
   }
   if (account.accountType === "zoho") {
-    return listZohoInbox(account, limit, opts?.pageToken);
+    return withImapRetry(() => listZohoInbox(account, limit, opts?.pageToken));
   }
   throw new Error("Unsupported account type");
 }
@@ -293,6 +327,7 @@ async function listZohoInbox(
     nextPageToken?: string;
   }>((resolve, reject) => {
     const imap = new Imap({
+      ...IMAP_BASE_OPTIONS,
       user: account.email,
       password,
       host: imapHost,
@@ -347,7 +382,11 @@ async function listZohoInbox(
             });
           });
 
-          fetch.once("end", () => {
+          fetch.on("error", (err: Error) => {
+            imap.end();
+            reject(err);
+          });
+          fetch.once("end", async () => {
             imap.end();
             const messages: InboxMessageListItem[] = [];
             const sortedUids = [...slice].sort((a, b) => b - a);
@@ -366,9 +405,8 @@ async function listZohoInbox(
               } catch {
                 date = new Date();
               }
-              const headerEnd = raw.indexOf("\r\n\r\n");
-              const bodyStart = headerEnd >= 0 ? headerEnd + 4 : 0;
-              const snippet = raw.slice(bodyStart, bodyStart + 200).replace(/\s+/g, " ").trim();
+              const body = await extractZohoBodyFromRaw(raw);
+              const snippet = body.slice(0, 200).replace(/\s+/g, " ").trim();
 
               if (isSpamTrackingPattern(subject) || isSpamTrackingPattern(snippet)) continue;
 
@@ -393,6 +431,12 @@ async function listZohoInbox(
       });
     });
     imap.once("error", reject);
+    imap.on("error", (err) => {
+      logger.warn("IMAP connection error", { error: formatError(err) });
+      try {
+        imap.end();
+      } catch {}
+    });
     imap.connect();
   });
 
@@ -416,7 +460,7 @@ export async function getInboxMessage(
     const match = messageId.match(/^zoho:(.+):(\d+)$/);
     const uid = match ? parseInt(match[2], 10) : parseInt(messageId, 10);
     if (isNaN(uid)) throw new Error("Invalid Zoho message ID");
-    return getZohoMessage(account, uid);
+    return withImapRetry(() => getZohoMessage(account, uid));
   }
   throw new Error("Unsupported account type");
 }
@@ -437,7 +481,7 @@ export async function getInboxThread(
     const match = messageId.match(/^zoho:(.+):(\d+)$/);
     const uid = match ? parseInt(match[2], 10) : parseInt(messageId, 10);
     if (isNaN(uid)) throw new Error("Invalid Zoho message ID");
-    return getZohoThread(account, uid);
+    return withImapRetry(() => getZohoThread(account, uid));
   }
   throw new Error("Unsupported account type");
 }
@@ -522,7 +566,7 @@ async function getGmailThread(
   };
 }
 
-const ZOHO_THREAD_FETCH_LIMIT = 300;
+const ZOHO_THREAD_FETCH_LIMIT = 100;
 
 async function getZohoThread(
   account: {
@@ -552,6 +596,7 @@ async function getZohoThread(
 
   const allMessages = await new Promise<MsgMeta[]>((resolve, reject) => {
     const imap = new Imap({
+      ...IMAP_BASE_OPTIONS,
       user: account.email,
       password,
       host: imapHost,
@@ -591,6 +636,10 @@ async function getZohoThread(
             });
           });
 
+          fetch.on("error", (err: Error) => {
+            imap.end();
+            reject(err);
+          });
           fetch.once("end", () => {
             imap.end();
             const result: MsgMeta[] = [];
@@ -624,6 +673,12 @@ async function getZohoThread(
       });
     });
     imap.once("error", reject);
+    imap.on("error", (err) => {
+      logger.warn("IMAP connection error", { error: formatError(err) });
+      try {
+        imap.end();
+      } catch {}
+    });
     imap.connect();
   });
 
@@ -679,8 +734,12 @@ async function getZohoThread(
 
   const messages: InboxThreadMessage[] = [];
   for (const m of threadMsgs) {
-    const body = extractZohoBodyFromRaw(m.raw);
-    if (isSpamTrackingPattern(m.subject) || isSpamTrackingPattern(body)) continue;
+    const body = await extractZohoBodyFromRaw(m.raw);
+    if (
+      (isSpamTrackingPattern(m.subject) || isSpamTrackingPattern(body)) &&
+      m.uid !== targetUid
+    )
+      continue;
 
     const fromEmail = extractEmailFromHeader(m.from);
     const isFromUs = account.email.toLowerCase() === fromEmail;
@@ -797,6 +856,7 @@ async function getZohoMessage(
 
   const result = await new Promise<InboxMessageFull>((resolve, reject) => {
     const imap = new Imap({
+      ...IMAP_BASE_OPTIONS,
       user: account.email,
       password,
       host: imapHost,
@@ -824,43 +884,42 @@ async function getZohoMessage(
             });
           });
         });
-        fetch.once("end", () => {
+        fetch.once("end", async () => {
             imap.end();
             if (!fullRaw) {
               reject(new Error("Message not found"));
               return;
             }
-            const headers = parseHeadersFromRaw(fullRaw);
-            const from = headers["from"] || "";
-            const to = headers["to"] || "";
-            const subject = headers["subject"] || "";
-            const dateStr = headers["date"] || "";
-            let date: Date;
             try {
-              date = new Date(dateStr);
-            } catch {
-              date = new Date();
-            }
-            const body = extractZohoBodyFromRaw(fullRaw);
-            const headerEnd = fullRaw.indexOf("\r\n\r\n");
-            const bodyStart = headerEnd >= 0 ? headerEnd + 4 : 0;
-            const snippet = fullRaw.slice(bodyStart, bodyStart + 200).replace(/\s+/g, " ").trim();
-            if (isSpamTrackingPattern(subject) || isSpamTrackingPattern(body)) {
-              reject(new Error("Message filtered"));
-              return;
-            }
-            const rfcMessageId = headers["message-id"];
-            const references = headers["references"];
-            const inReplyTo = headers["in-reply-to"];
+              const headers = parseHeadersFromRaw(fullRaw);
+              const from = headers["from"] || "";
+              const to = headers["to"] || "";
+              const subject = headers["subject"] || "";
+              const dateStr = headers["date"] || "";
+              let date: Date;
+              try {
+                date = new Date(dateStr);
+              } catch {
+                date = new Date();
+              }
+              const body = await extractZohoBodyFromRaw(fullRaw);
+              const snippet = body.slice(0, 200).replace(/\s+/g, " ").trim();
+              if (isSpamTrackingPattern(subject) || isSpamTrackingPattern(body)) {
+                reject(new Error("Message filtered"));
+                return;
+              }
+              const rfcMessageId = headers["message-id"];
+              const references = headers["references"];
+              const inReplyTo = headers["in-reply-to"];
 
-            findSentEmailForMessage(
-              account.id,
-              "zoho",
-              undefined,
-              rfcMessageId,
-              references,
-              inReplyTo
-            ).then((sentEmail) => {
+              const sentEmail = await findSentEmailForMessage(
+                account.id,
+                "zoho",
+                undefined,
+                rfcMessageId,
+                references,
+                inReplyTo
+              );
               resolve({
                 id: `zoho:${account.id}:${uid}`,
                 accountId: account.id,
@@ -878,7 +937,9 @@ async function getZohoMessage(
                 references,
                 sentEmail,
               });
-            });
+            } catch (e) {
+              reject(e);
+            }
           });
         fetch.on("error", (err: Error) => {
           imap.end();
@@ -887,6 +948,12 @@ async function getZohoMessage(
       });
     });
     imap.once("error", reject);
+    imap.on("error", (err) => {
+      logger.warn("IMAP connection error", { error: formatError(err) });
+      try {
+        imap.end();
+      } catch {}
+    });
     imap.connect();
   });
 
@@ -898,6 +965,12 @@ async function getZohoMessage(
 export async function getUnreadCount(
   accountId?: string
 ): Promise<{ total: number; byAccount?: Record<string, number> }> {
+  const cacheKey = accountId ?? "all";
+  const cached = unreadCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+
   const where = accountId ? { id: accountId } : {};
   const accounts = await prisma.emailAccount.findMany({
     where: { ...where, isActive: true },
@@ -912,7 +985,7 @@ export async function getUnreadCount(
       if (account.accountType === "google") {
         count = await getGmailUnreadCount(account);
       } else if (account.accountType === "zoho") {
-        count = await getZohoUnreadCount(account);
+        count = await withImapRetry(() => getZohoUnreadCount(account));
       }
       byAccount[account.id] = count;
       total += count;
@@ -922,8 +995,13 @@ export async function getUnreadCount(
     }
   }
 
+  const result = { total, byAccount };
+  unreadCache.set(cacheKey, {
+    value: result,
+    expiresAt: Date.now() + UNREAD_CACHE_TTL_MS,
+  });
   logger.info("Inbox unread count", { total, byAccount });
-  return { total, byAccount };
+  return result;
 }
 
 async function getGmailUnreadCount(account: {
@@ -962,6 +1040,7 @@ async function getZohoUnreadCount(account: {
 
   return new Promise((resolve, reject) => {
     const imap = new Imap({
+      ...IMAP_BASE_OPTIONS,
       user: account.email,
       password,
       host: imapHost,
@@ -983,6 +1062,12 @@ async function getZohoUnreadCount(account: {
       });
     });
     imap.once("error", reject);
+    imap.on("error", (err) => {
+      logger.warn("IMAP connection error", { error: formatError(err) });
+      try {
+        imap.end();
+      } catch {}
+    });
     imap.connect();
   });
 }

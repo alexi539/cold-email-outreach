@@ -95,7 +95,7 @@ model Lead {
 model SentEmail {
   id              String    @id @default(uuid())
   leadId          String    @map("lead_id")
-  accountId       String    @map("account_id")
+  accountId       String?   @map("account_id") // null when account was deleted (history preserved)
   campaignId      String    @map("campaign_id")
   stepOrder       Int       @map("step_order")
   subject         String
@@ -110,7 +110,7 @@ model SentEmail {
   replyType       String?   @map("reply_type") // human | bounce | auto_reply
 
   lead          Lead @relation(fields: [leadId], references: [id], onDelete: Cascade)
-  account       EmailAccount @relation(fields: [accountId], references: [id])
+  account       EmailAccount? @relation(fields: [accountId], references: [id])
   campaign      Campaign @relation(fields: [campaignId], references: [id])
   replyMessages ReplyMessage[]
 }

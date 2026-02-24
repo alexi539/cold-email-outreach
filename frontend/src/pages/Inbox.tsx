@@ -1,14 +1,13 @@
-import { useEffect, useState } from "react";
-import { accounts, inbox } from "../api";
+import { useState } from "react";
+import { inbox } from "../api";
 import type {
   Account,
   InboxMessageListItem,
   InboxThreadResponse,
   InboxThreadMessage,
 } from "../api";
+import { useInbox, UNIFIED_VALUE } from "../contexts/InboxContext";
 import { RichTextEditor } from "../components/RichTextEditor";
-
-const UNIFIED_VALUE = "__all__";
 
 function extractEmailFromHeader(s: string): string {
   const m = /<([^>]+)>/.exec(s);
@@ -23,76 +22,40 @@ function replySubject(subject: string): string {
 }
 
 export default function Inbox() {
-  const [accountsList, setAccountsList] = useState<Account[]>([]);
-  const [selectedAccountId, setSelectedAccountId] = useState<string>("");
-  const [messages, setMessages] = useState<InboxMessageListItem[]>([]);
-  const [nextPageToken, setNextPageToken] = useState<string | undefined>();
-  const [loading, setLoading] = useState(false);
+  const {
+    accountId: selectedAccountId,
+    setAccountId,
+    messages,
+    nextPageToken,
+    loading,
+    error: inboxError,
+    clearError,
+    loadMore,
+    refresh: contextRefresh,
+    activeAccounts,
+  } = useInbox();
+
   const [selectedListItem, setSelectedListItem] = useState<InboxMessageListItem | null>(null);
   const [selectedThread, setSelectedThread] = useState<InboxThreadResponse | null>(null);
   const [loadingThread, setLoadingThread] = useState(false);
+  const [threadError, setThreadError] = useState<string | null>(null);
   const [replyBody, setReplyBody] = useState("");
   const [replyFromAccountId, setReplyFromAccountId] = useState<string>("");
   const [sending, setSending] = useState(false);
 
   const isUnified = selectedAccountId === UNIFIED_VALUE;
-  const activeAccounts = accountsList.filter((a) => a.isActive);
 
-  useEffect(() => {
-    accounts.list().then(setAccountsList).catch(console.error);
-  }, []);
-
-  useEffect(() => {
-    if (!selectedAccountId) {
-      setMessages([]);
-      setNextPageToken(undefined);
-      setSelectedListItem(null);
-      setSelectedThread(null);
-      return;
-    }
-    setLoading(true);
-    const fetcher = isUnified
-      ? inbox.listAll({ limit: 50 })
-      : inbox.list(selectedAccountId, { limit: 50 });
-    fetcher
-      .then((res) => {
-        setMessages(res.messages);
-        setNextPageToken(res.nextPageToken);
-      })
-      .catch(console.error)
-      .finally(() => setLoading(false));
+  const handleAccountChange = (newId: string) => {
+    setAccountId(newId);
     setSelectedListItem(null);
     setSelectedThread(null);
-  }, [selectedAccountId, isUnified]);
-
-  const loadMore = () => {
-    if (!selectedAccountId || !nextPageToken || loading) return;
-    setLoading(true);
-    const fetcher = isUnified
-      ? inbox.listAll({ limit: 50, pageToken: nextPageToken })
-      : inbox.list(selectedAccountId, { limit: 50, pageToken: nextPageToken });
-    fetcher
-      .then((res) => {
-        setMessages((prev) => [...prev, ...res.messages]);
-        setNextPageToken(res.nextPageToken);
-      })
-      .catch(console.error)
-      .finally(() => setLoading(false));
+    setThreadError(null);
+    clearError();
   };
 
-  const refresh = () => {
-    if (!selectedAccountId) return;
-    setLoading(true);
-    const fetcher = isUnified
-      ? inbox.listAll({ limit: 50 })
-      : inbox.list(selectedAccountId, { limit: 50 });
-    fetcher
-      .then((res) => {
-        setMessages(res.messages);
-        setNextPageToken(res.nextPageToken);
-      })
-      .catch(console.error)
-      .finally(() => setLoading(false));
+  const refresh = async () => {
+    setThreadError(null);
+    await contextRefresh();
     if (selectedListItem) {
       setLoadingThread(true);
       inbox
@@ -101,12 +64,16 @@ export default function Inbox() {
           setSelectedThread(thread);
           setReplyFromAccountId(thread.accountId);
         })
-        .catch(console.error)
+        .catch((e) => {
+          const msg = e instanceof Error ? e.message : "Failed to load thread";
+          setThreadError(msg);
+        })
         .finally(() => setLoadingThread(false));
     }
   };
 
   const selectMessage = (msg: InboxMessageListItem) => {
+    setThreadError(null);
     setLoadingThread(true);
     setSelectedListItem(msg);
     setSelectedThread(null);
@@ -117,7 +84,10 @@ export default function Inbox() {
         setSelectedThread(thread);
         setReplyFromAccountId(thread.accountId);
       })
-      .catch(console.error)
+      .catch((e) => {
+        const msg = e instanceof Error ? e.message : "Failed to load thread";
+        setThreadError(msg);
+      })
       .finally(() => setLoadingThread(false));
   };
 
@@ -144,7 +114,7 @@ export default function Inbox() {
         body: replyBody,
       });
       setReplyBody("");
-      refresh();
+      await refresh();
       window.dispatchEvent(new Event("inbox-update"));
     } catch (e) {
       alert(e instanceof Error ? e.message : "Failed to send");
@@ -159,12 +129,44 @@ export default function Inbox() {
       <p style={{ margin: "0 0 1rem", color: "#a1a1aa", fontSize: "0.875rem" }}>
         All incoming messages from your email accounts. Select a message to read and reply.
       </p>
+      {inboxError && (
+        <div
+          style={{
+            marginBottom: "1rem",
+            padding: "0.75rem 1rem",
+            background: "#450a0a",
+            border: "1px solid #b91c1c",
+            borderRadius: 6,
+            color: "#fca5a5",
+            fontSize: "0.875rem",
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+          }}
+        >
+          <span>{inboxError}</span>
+          <button
+            onClick={() => clearError()}
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "#fca5a5",
+              cursor: "pointer",
+              fontSize: "1.25rem",
+              padding: "0 0.25rem",
+            }}
+            aria-label="Dismiss"
+          >
+            ×
+          </button>
+        </div>
+      )}
       <div style={{ marginBottom: "1rem", display: "flex", gap: "1rem", alignItems: "center", flexWrap: "wrap" }}>
         <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
           <label style={{ fontSize: "0.875rem" }}>Account:</label>
           <select
             value={selectedAccountId}
-            onChange={(e) => setSelectedAccountId(e.target.value)}
+            onChange={(e) => handleAccountChange(e.target.value)}
             style={{
               padding: "0.5rem",
               background: "#27272a",
@@ -307,9 +309,13 @@ export default function Inbox() {
         <div style={{ padding: "1rem", overflowY: "auto" }}>
           {!selectedThread ? (
             <div style={{ color: "#71717a", padding: "2rem" }}>
-              {selectedAccountId && messages.length > 0
-                ? "Select a message to read and reply."
-                : ""}
+              {threadError ? (
+                <div style={{ color: "#ef4444" }}>{threadError}</div>
+              ) : selectedAccountId && messages.length > 0 ? (
+                "Select a message to read and reply."
+              ) : (
+                ""
+              )}
             </div>
           ) : loadingThread ? (
             <div style={{ color: "#71717a" }}>Loading thread...</div>

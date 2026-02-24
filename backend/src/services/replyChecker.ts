@@ -12,6 +12,8 @@ import type { gmail_v1 } from "googleapis";
 const GMAIL_BATCH_LIMIT = Number(process.env.REPLY_CHECK_GMAIL_LIMIT) || 150;
 const GMAIL_REQUEST_DELAY_MS = 100;
 
+const IMAP_BASE_OPTIONS = { connTimeout: 30000, authTimeout: 15000 };
+
 async function applyReplyUpdate(
   sentEmailId: string,
   leadId: string,
@@ -249,6 +251,7 @@ async function checkZohoReplies() {
       await new Promise<void>((resolve, reject) => {
         const imapHost = account.zohoProServers ? "imappro.zoho.com" : "imap.zoho.com";
         const imap = new Imap({
+          ...IMAP_BASE_OPTIONS,
           user: account.email,
           password,
           host: imapHost,
@@ -280,6 +283,10 @@ async function checkZohoReplies() {
               const fetch = imap.fetch(uids.slice(-ZOHO_FETCH_LIMIT), { bodies: "" });
               const rawByUid = new Map<number, { raw: string; replyAt: Date }>();
               const seenExternalIds = new Set<string>();
+              fetch.on("error", (err: Error) => {
+                imap.end();
+                reject(err);
+              });
               fetch.on("message", (msg) => {
                 const state: { uid?: number } = {};
                 let fullRaw = "";
@@ -345,15 +352,15 @@ async function checkZohoReplies() {
                   });
                 }
                 if (folderMatches.length === 0) return cb();
-                const bodyByUid = new Map<number, { body: string; replyAt: Date }>();
-                for (const m of folderMatches) {
-                  const entry = rawByUid.get(m.uid);
-                  if (entry) {
-                    const body = extractZohoBodyFromRaw(entry.raw);
-                    bodyByUid.set(m.uid, { body, replyAt: entry.replyAt });
-                  }
-                }
                 void (async () => {
+                  const bodyByUid = new Map<number, { body: string; replyAt: Date }>();
+                  for (const m of folderMatches) {
+                    const entry = rawByUid.get(m.uid);
+                    if (entry) {
+                      const body = await extractZohoBodyFromRaw(entry.raw);
+                      bodyByUid.set(m.uid, { body, replyAt: entry.replyAt });
+                    }
+                  }
                   for (const match of folderMatches) {
                     try {
                       const entry = bodyByUid.get(match.uid);
@@ -437,6 +444,12 @@ async function checkZohoReplies() {
           next();
         });
         imap.once("error", reject);
+        imap.on("error", (err) => {
+          logger.warn("IMAP connection error", { error: formatError(err) });
+          try {
+            imap.end();
+          } catch {}
+        });
         imap.connect();
       });
     } catch (e) {
@@ -512,7 +525,7 @@ export async function refreshReplyForSentEmail(sentEmailId: string): Promise<{ u
   }
 
   if (account.accountType === "zoho" && sent.messageId) {
-    return refreshZohoReplyForSentEmail(sent);
+    return refreshZohoReplyForSentEmail({ ...sent, account });
   }
 
   return { updated: false, error: "No gmailThreadId or messageId" };
@@ -539,6 +552,7 @@ async function refreshZohoReplyForSentEmail(sent: {
   try {
     const result = await new Promise<{ body: string; replyAt: Date } | null>((resolve, reject) => {
       const imap = new Imap({
+        ...IMAP_BASE_OPTIONS,
         user: sent.account.email,
         password,
         host: imapHost,
@@ -558,6 +572,10 @@ async function refreshZohoReplyForSentEmail(sent: {
           imap.search(["ALL"], (searchErr, uids) => {
             if (searchErr || !uids?.length) return cb();
             const fetch = imap.fetch(uids.slice(-ZOHO_FETCH_LIMIT), { bodies: "" });
+            fetch.on("error", (err: Error) => {
+              imap.end();
+              reject(err);
+            });
             fetch.on("message", (msg) => {
               const state: { uid?: number; date?: Date } = {};
               let fullRaw = "";
@@ -595,26 +613,32 @@ async function refreshZohoReplyForSentEmail(sent: {
 
       imap.once("ready", () => {
         let idx = 0;
-        function next() {
+        async function next() {
           if (found || idx >= ZOHO_FOLDERS.length) {
             if (!found) {
               imap.end();
               return resolve(null);
             }
             imap.end();
-            const body = extractZohoBodyFromRaw(found.raw);
+            const body = await extractZohoBodyFromRaw(found.raw);
             resolve(body ? { body, replyAt: found.replyAt } : null);
           } else {
             processFolder(ZOHO_FOLDERS[idx], (err) => {
               if (err) return reject(err);
               idx++;
-              next();
+              void next().catch(reject);
             });
           }
         }
-        next();
+        void next().catch(reject);
       });
       imap.once("error", reject);
+      imap.on("error", (err) => {
+        logger.warn("IMAP connection error", { error: formatError(err) });
+        try {
+          imap.end();
+        } catch {}
+      });
       imap.connect();
     });
 

@@ -13,15 +13,15 @@ import { inbox } from "./api";
 function App() {
   const [unreadCount, setUnreadCount] = useState(0);
 
-  const fetchUnread = () => {
-    inbox.unreadCount().then((r) => setUnreadCount(r.total)).catch(() => setUnreadCount(0));
+  const fetchUnread = (fresh = false) => {
+    inbox.unreadCount(undefined, { fresh }).then((r) => setUnreadCount(r.total)).catch(() => setUnreadCount(0));
   };
 
   useEffect(() => {
-    fetchUnread();
-    const interval = setInterval(fetchUnread, 120000);
-    const onFocus = () => fetchUnread();
-    const onInboxUpdate = () => fetchUnread();
+    fetchUnread(true);
+    const interval = setInterval(() => fetchUnread(false), 60000);
+    const onFocus = () => fetchUnread(true);
+    const onInboxUpdate = () => fetchUnread(true);
     window.addEventListener("focus", onFocus);
     window.addEventListener("inbox-update", onInboxUpdate);
     return () => {

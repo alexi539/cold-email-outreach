@@ -189,9 +189,12 @@ export const inbox = {
     fetchApi<InboxMessageFull>(`/inbox/${accountId}/messages/${encodeURIComponent(messageId)}`),
   getThread: (accountId: string, messageId: string) =>
     fetchApi<InboxThreadResponse>(`/inbox/${accountId}/thread/${encodeURIComponent(messageId)}`),
-  unreadCount: (accountId?: string) => {
-    const q = accountId ? `?accountId=${encodeURIComponent(accountId)}` : "";
-    return fetchApi<{ total: number; byAccount?: Record<string, number> }>(`/inbox/unread-count${q}`);
+  unreadCount: (accountId?: string, opts?: { fresh?: boolean }) => {
+    const q = new URLSearchParams();
+    if (accountId) q.set("accountId", accountId);
+    if (opts?.fresh) q.set("fresh", "1");
+    const s = q.toString();
+    return fetchApi<{ total: number; byAccount?: Record<string, number> }>(`/inbox/unread-count${s ? `?${s}` : ""}`);
   },
   sendReply: (data: { accountId: string; messageId: string; to: string; subject: string; body: string }) =>
     fetchApi<{ success: boolean }>("/inbox/send-reply", { method: "POST", body: JSON.stringify(data) }),

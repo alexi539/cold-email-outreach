@@ -15,6 +15,8 @@ const STORAGE_KEY_CACHE = "inbox.cache";
 const CACHE_LIMIT_ALL = 200;
 const CACHE_LIMIT_SINGLE = 50;
 const REFETCH_INTERVAL_MS = 2 * 60 * 1000; // 2 min
+/** Cache older than this is ignored — ensures read status from Gmail/Zoho web syncs */
+const CACHE_MAX_AGE_MS = 30 * 1000; // 30 sec
 
 export const UNIFIED_VALUE = "__all__";
 
@@ -150,9 +152,17 @@ export function InboxProvider({ children }: { children: ReactNode }) {
       return;
     }
     const cached = loadCacheFromStorage();
-    if (cached && cached.accountId === accountId && cached.messages.length > 0) {
+    const cacheFresh =
+      cached &&
+      cached.accountId === accountId &&
+      cached.messages.length > 0 &&
+      Date.now() - (cached.lastFetchedAt ?? 0) < CACHE_MAX_AGE_MS;
+    if (cacheFresh) {
       setMessages(cached.messages);
       setNextPageToken(cached.nextPageToken);
+    } else {
+      setMessages([]);
+      setNextPageToken(undefined);
     }
     fetchInbox(accountId);
   }, [accountId]);

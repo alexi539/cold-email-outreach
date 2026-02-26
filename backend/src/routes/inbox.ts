@@ -58,9 +58,10 @@ router.get("/all", async (req, res) => {
 
 router.get("/unread-count", async (req, res) => {
   try {
-    const { accountId } = req.query;
+    const { accountId, fresh } = req.query;
     const result = await getUnreadCount(
-      typeof accountId === "string" ? accountId : undefined
+      typeof accountId === "string" ? accountId : undefined,
+      { fresh: fresh === "1" || fresh === "true" }
     );
     res.json(result);
   } catch (e) {

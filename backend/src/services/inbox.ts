@@ -59,7 +59,7 @@ const GMAIL_REQUEST_DELAY_MS = 25;
 
 const IMAP_BASE_OPTIONS = { connTimeout: 30000, authTimeout: 15000 };
 
-const UNREAD_CACHE_TTL_MS = 60_000;
+const UNREAD_CACHE_TTL_MS = 30_000; // 30 sec — syncs read status from Gmail/Zoho web faster
 const unreadCache = new Map<
   string,
   { value: { total: number; byAccount?: Record<string, number> }; expiresAt: number }
@@ -567,6 +567,92 @@ async function getGmailThread(
 }
 
 const ZOHO_THREAD_FETCH_LIMIT = 100;
+const ZOHO_SENT_FETCH_LIMIT = 50;
+const ZOHO_SENT_FOLDERS = ["Sent", "Sent Items"] as const;
+
+type ZohoMsgMeta = {
+  uid: number;
+  folder: string;
+  raw: string;
+  from: string;
+  to: string;
+  subject: string;
+  date: string;
+  messageId: string;
+  inReplyTo: string;
+  references: string;
+};
+
+async function fetchZohoFolder(
+  imap: Imap,
+  folder: string,
+  limit: number
+): Promise<ZohoMsgMeta[]> {
+  return new Promise((resolve, reject) => {
+    imap.openBox(folder, false, (err) => {
+      if (err) {
+        resolve([]);
+        return;
+      }
+      imap.search(["ALL"], (searchErr, uids) => {
+        if (searchErr || !uids?.length) {
+          resolve([]);
+          return;
+        }
+        const sorted = [...uids].sort((a, b) => b - a);
+        const slice = sorted.slice(0, limit);
+        const fetch = imap.fetch(slice, { bodies: "" });
+        const rawByUid = new Map<number, string>();
+
+        fetch.on("message", (msg) => {
+          const state: { uid?: number } = {};
+          let fullRaw = "";
+          msg.on("attributes", (attrs: { uid?: number }) => {
+            state.uid = attrs.uid;
+          });
+          msg.on("body", (stream: NodeJS.ReadableStream) => {
+            stream.on("data", (chunk: Buffer) => {
+              fullRaw += chunk.toString("utf-8");
+            });
+          });
+          msg.on("end", () => {
+            if (state.uid != null) rawByUid.set(state.uid, fullRaw);
+          });
+        });
+
+        fetch.on("error", (err: Error) => reject(err));
+        fetch.once("end", () => {
+          const result: ZohoMsgMeta[] = [];
+          for (const uid of slice) {
+            const raw = rawByUid.get(uid);
+            if (!raw) continue;
+            const headers = parseHeadersFromRaw(raw);
+            const dateStr = headers["date"] || "";
+            let date: string;
+            try {
+              date = new Date(dateStr).toISOString();
+            } catch {
+              date = new Date().toISOString();
+            }
+            result.push({
+              uid,
+              folder,
+              raw,
+              from: headers["from"] || "",
+              to: headers["to"] || "",
+              subject: headers["subject"] || "",
+              date,
+              messageId: (headers["message-id"] || "").replace(/^<|>$/g, "").trim(),
+              inReplyTo: (headers["in-reply-to"] || "").replace(/^<|>$/g, "").trim(),
+              references: headers["references"] || "",
+            });
+          }
+          resolve(result);
+        });
+      });
+    });
+  });
+}
 
 async function getZohoThread(
   account: {
@@ -582,19 +668,7 @@ async function getZohoThread(
 
   const imapHost = account.zohoProServers ? "imappro.zoho.com" : "imap.zoho.com";
 
-  type MsgMeta = {
-    uid: number;
-    raw: string;
-    from: string;
-    to: string;
-    subject: string;
-    date: string;
-    messageId: string;
-    inReplyTo: string;
-    references: string;
-  };
-
-  const allMessages = await new Promise<MsgMeta[]>((resolve, reject) => {
+  const allMessages = await new Promise<ZohoMsgMeta[]>((resolve, reject) => {
     const imap = new Imap({
       ...IMAP_BASE_OPTIONS,
       user: account.email,
@@ -604,73 +678,20 @@ async function getZohoThread(
       tls: true,
     });
 
-    imap.once("ready", () => {
-      imap.openBox("INBOX", false, (err) => {
-        if (err) {
-          imap.end();
-          return reject(err);
+    imap.once("ready", async () => {
+      try {
+        const inboxMsgs = await fetchZohoFolder(imap, "INBOX", ZOHO_THREAD_FETCH_LIMIT);
+        let sentMsgs: ZohoMsgMeta[] = [];
+        for (const folder of ZOHO_SENT_FOLDERS) {
+          sentMsgs = await fetchZohoFolder(imap, folder, ZOHO_SENT_FETCH_LIMIT);
+          if (sentMsgs.length > 0) break;
         }
-        imap.search(["ALL"], (searchErr, uids) => {
-          if (searchErr || !uids?.length) {
-            imap.end();
-            return resolve([]);
-          }
-          const sorted = [...uids].sort((a, b) => b - a);
-          const slice = sorted.slice(0, ZOHO_THREAD_FETCH_LIMIT);
-          const fetch = imap.fetch(slice, { bodies: "" });
-          const rawByUid = new Map<number, string>();
-
-          fetch.on("message", (msg) => {
-            const state: { uid?: number } = {};
-            let fullRaw = "";
-            msg.on("attributes", (attrs: { uid?: number }) => {
-              state.uid = attrs.uid;
-            });
-            msg.on("body", (stream: NodeJS.ReadableStream) => {
-              stream.on("data", (chunk: Buffer) => {
-                fullRaw += chunk.toString("utf-8");
-              });
-            });
-            msg.on("end", () => {
-              if (state.uid != null) rawByUid.set(state.uid, fullRaw);
-            });
-          });
-
-          fetch.on("error", (err: Error) => {
-            imap.end();
-            reject(err);
-          });
-          fetch.once("end", () => {
-            imap.end();
-            const result: MsgMeta[] = [];
-            for (const uid of slice) {
-              const raw = rawByUid.get(uid);
-              if (!raw) continue;
-              const headers = parseHeadersFromRaw(raw);
-              const dateStr = headers["date"] || "";
-              let date: string;
-              try {
-                date = new Date(dateStr).toISOString();
-              } catch {
-                date = new Date().toISOString();
-              }
-              result.push({
-                uid,
-                raw,
-                from: headers["from"] || "",
-                to: headers["to"] || "",
-                subject: headers["subject"] || "",
-                date,
-                messageId: (headers["message-id"] || "").replace(/^<|>$/g, "").trim(),
-                inReplyTo: (headers["in-reply-to"] || "").replace(/^<|>$/g, "").trim(),
-                references: headers["references"] || "",
-              });
-            }
-            result.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-            resolve(result);
-          });
-        });
-      });
+        imap.end();
+        resolve([...inboxMsgs, ...sentMsgs]);
+      } catch (e) {
+        imap.end();
+        reject(e);
+      }
     });
     imap.once("error", reject);
     imap.on("error", (err) => {
@@ -689,7 +710,7 @@ async function getZohoThread(
       .map((r) => normalizeId(r))
       .filter(Boolean);
 
-  const targetMsg = allMessages.find((m) => m.uid === targetUid);
+  const targetMsg = allMessages.find((m) => m.folder === "INBOX" && m.uid === targetUid);
   if (!targetMsg) throw new Error("Message not found");
 
   const targetMsgId = normalizeId(targetMsg.messageId);
@@ -728,7 +749,7 @@ async function getZohoThread(
   const threadMsgs = allMessages
     .filter((m) => {
       const mid = normalizeId(m.messageId);
-      return allIds.has(mid) || m.uid === targetUid;
+      return allIds.has(mid) || (m.folder === "INBOX" && m.uid === targetUid);
     })
     .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
 
@@ -737,7 +758,7 @@ async function getZohoThread(
     const body = await extractZohoBodyFromRaw(m.raw);
     if (
       (isSpamTrackingPattern(m.subject) || isSpamTrackingPattern(body)) &&
-      m.uid !== targetUid
+      !(m.folder === "INBOX" && m.uid === targetUid)
     )
       continue;
 
@@ -745,7 +766,7 @@ async function getZohoThread(
     const isFromUs = account.email.toLowerCase() === fromEmail;
 
     messages.push({
-      id: `zoho:${account.id}:${m.uid}`,
+      id: `zoho:${account.id}:${m.folder}:${m.uid}`,
       from: m.from,
       to: m.to,
       subject: m.subject,
@@ -963,11 +984,12 @@ async function getZohoMessage(
 }
 
 export async function getUnreadCount(
-  accountId?: string
+  accountId?: string,
+  opts?: { fresh?: boolean }
 ): Promise<{ total: number; byAccount?: Record<string, number> }> {
   const cacheKey = accountId ?? "all";
   const cached = unreadCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) {
+  if (!opts?.fresh && cached && cached.expiresAt > Date.now()) {
     return cached.value;
   }
 

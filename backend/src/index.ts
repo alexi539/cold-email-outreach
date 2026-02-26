@@ -13,6 +13,7 @@ import { leadsRouter, handleLeadsUpload } from "./routes/leads.js";
 import { historyRouter } from "./routes/history.js";
 import { inboxRouter } from "./routes/inbox.js";
 import { statsRouter } from "./routes/stats.js";
+import { adminRouter } from "./routes/admin.js";
 import { runSendCycle } from "./services/scheduler.js";
 import { checkReplies } from "./services/replyChecker.js";
 import { logger, formatError } from "./lib/logger.js";
@@ -35,6 +36,7 @@ app.use("/api/leads", leadsRouter);
 app.use("/api/history", historyRouter);
 app.use("/api/inbox", inboxRouter);
 app.use("/api/stats", statsRouter);
+app.use("/api/admin", adminRouter);
 
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 

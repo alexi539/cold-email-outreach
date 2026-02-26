@@ -20,6 +20,9 @@ backend/public/
 # Validated backups (contain email data)
 backend/validated-backups/*.json
 
+# Export/import (contains encrypted credentials)
+backend/zoho-accounts.json
+
 # Logs
 *.log
 npm-debug.log*

@@ -29,6 +29,15 @@ export async function runSendCycle() {
 
   const now = new Date();
 
+  // Reset limits for ALL active accounts so sentToday stays correct even when campaigns are paused
+  const allAccounts = await prisma.emailAccount.findMany({
+    where: { isActive: true },
+    select: { id: true, limitResetAt: true, sentToday: true, dailyLimit: true },
+  });
+  for (const acc of allAccounts) {
+    await maybeResetAccountLimit(acc);
+  }
+
   for (const campaign of campaigns) {
     let sentThisRun = 0;
     if (!campaign.sequence?.steps?.length) {

@@ -25,6 +25,8 @@ export async function sendZoho(
       user: account.email,
       pass: password,
     },
+    connectionTimeout: 30_000,
+    greetingTimeout: 15_000,
   });
 
   const mailOptions: nodemailer.SendMailOptions = {

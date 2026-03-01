@@ -45,6 +45,8 @@ export interface InboxThreadMessage {
   date: string;
   body: string;
   messageId?: string;
+  references?: string;
+  inReplyTo?: string;
   isFromUs?: boolean;
 }
 
@@ -52,6 +54,7 @@ export interface InboxThreadResponse {
   messages: InboxThreadMessage[];
   accountId: string;
   accountEmail: string;
+  threadId?: string;
 }
 
 const DEFAULT_LIMIT = 50;
@@ -554,6 +557,8 @@ async function getGmailThread(
       date,
       body,
       messageId: getHeader(payload, "Message-ID") || undefined,
+      references: getHeader(payload, "References") || undefined,
+      inReplyTo: getHeader(payload, "In-Reply-To") || undefined,
       isFromUs,
     });
   }
@@ -563,6 +568,7 @@ async function getGmailThread(
     messages,
     accountId: account.id,
     accountEmail: account.email,
+    threadId: threadId || undefined,
   };
 }
 
@@ -773,6 +779,8 @@ async function getZohoThread(
       date: m.date,
       body,
       messageId: m.messageId || undefined,
+      references: m.references || undefined,
+      inReplyTo: m.inReplyTo || undefined,
       isFromUs,
     });
   }
@@ -1101,6 +1109,9 @@ export async function sendReply(
     to: string;
     subject: string;
     body: string;
+    rfcMessageId?: string;
+    references?: string;
+    threadId?: string;
   }
 ): Promise<{ success: boolean; error?: string }> {
   const account = await prisma.emailAccount.findUnique({
@@ -1108,12 +1119,26 @@ export async function sendReply(
   });
   if (!account) return { success: false, error: "Account not found" };
 
-  const msg = await getInboxMessage(accountId, opts.messageId);
-  const rfcMessageId = msg.messageId;
-  const inReplyTo = rfcMessageId;
-  const references = msg.references
-    ? `${msg.references} ${rfcMessageId || ""}`.trim()
-    : rfcMessageId;
+  let rfcMessageId: string | undefined;
+  let references: string | undefined;
+  let threadId: string | undefined;
+
+  const wrapMsgId = (id: string) => (id.startsWith("<") ? id : `<${id}>`);
+
+  if (opts.rfcMessageId) {
+    rfcMessageId = wrapMsgId(opts.rfcMessageId.trim());
+    references = opts.references
+      ? `${opts.references} ${rfcMessageId}`.trim()
+      : rfcMessageId;
+    threadId = opts.threadId;
+  } else {
+    const msg = await getInboxMessage(accountId, opts.messageId);
+    rfcMessageId = msg.messageId;
+    references = msg.references
+      ? `${msg.references} ${rfcMessageId || ""}`.trim()
+      : rfcMessageId;
+    threadId = msg.threadId;
+  }
 
   let subject = opts.subject;
   if (!subject.toLowerCase().startsWith("re:")) {
@@ -1123,13 +1148,13 @@ export async function sendReply(
   try {
     if (account.accountType === "google") {
       await sendGmail(account, opts.to, subject, opts.body, {
-        threadId: msg.threadId,
-        inReplyTo: inReplyTo || undefined,
+        threadId: threadId,
+        inReplyTo: rfcMessageId || undefined,
         references: references || undefined,
       });
     } else if (account.accountType === "zoho") {
       await sendZoho(account, opts.to, subject, opts.body, {
-        inReplyTo: inReplyTo || undefined,
+        inReplyTo: rfcMessageId || undefined,
         references: references || undefined,
       });
     } else {

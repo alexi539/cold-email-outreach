@@ -112,12 +112,21 @@ export default function Inbox() {
         to,
         subject,
         body: replyBody,
+        rfcMessageId: lastFromThem.messageId,
+        references: lastFromThem.references,
+        threadId: selectedThread.threadId,
       });
       setReplyBody("");
       await refresh();
       window.dispatchEvent(new Event("inbox-update"));
     } catch (e) {
-      alert(e instanceof Error ? e.message : "Failed to send");
+      const msg =
+        e instanceof Error && e.name === "AbortError"
+          ? "Request timed out. Please try again."
+          : e instanceof Error
+            ? e.message
+            : "Failed to send";
+      alert(msg);
     } finally {
       setSending(false);
     }

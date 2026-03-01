@@ -72,7 +72,7 @@ router.get("/unread-count", async (req, res) => {
 
 router.post("/send-reply", async (req, res) => {
   try {
-    const { accountId, messageId, to, subject, body } = req.body;
+    const { accountId, messageId, to, subject, body, rfcMessageId, references, threadId } = req.body;
     if (!accountId || !messageId || !to || !subject) {
       return res.status(400).json({
         error: "accountId, messageId, to, and subject required",
@@ -83,6 +83,9 @@ router.post("/send-reply", async (req, res) => {
       to: String(to),
       subject: String(subject),
       body: typeof body === "string" ? body : "",
+      rfcMessageId: typeof rfcMessageId === "string" ? rfcMessageId.trim() : undefined,
+      references: typeof references === "string" ? references : undefined,
+      threadId: typeof threadId === "string" ? threadId : undefined,
     });
     if (!result.success) {
       return res.status(400).json({ error: result.error || "Send failed" });

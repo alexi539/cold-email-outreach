@@ -163,6 +163,8 @@ export interface InboxThreadMessage {
   date: string;
   body: string;
   messageId?: string;
+  references?: string;
+  inReplyTo?: string;
   isFromUs?: boolean;
 }
 
@@ -170,6 +172,7 @@ export interface InboxThreadResponse {
   messages: InboxThreadMessage[];
   accountId: string;
   accountEmail: string;
+  threadId?: string;
 }
 
 export const inbox = {
@@ -196,8 +199,24 @@ export const inbox = {
     const s = q.toString();
     return fetchApi<{ total: number; byAccount?: Record<string, number> }>(`/inbox/unread-count${s ? `?${s}` : ""}`);
   },
-  sendReply: (data: { accountId: string; messageId: string; to: string; subject: string; body: string }) =>
-    fetchApi<{ success: boolean }>("/inbox/send-reply", { method: "POST", body: JSON.stringify(data) }),
+  sendReply: (data: {
+    accountId: string;
+    messageId: string;
+    to: string;
+    subject: string;
+    body: string;
+    rfcMessageId?: string;
+    references?: string;
+    threadId?: string;
+  }) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60_000);
+    return fetchApi<{ success: boolean }>("/inbox/send-reply", {
+      method: "POST",
+      body: JSON.stringify(data),
+      signal: controller.signal,
+    }).finally(() => clearTimeout(timeout));
+  },
 };
 
 export const stats = {

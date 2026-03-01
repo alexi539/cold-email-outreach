@@ -17,16 +17,17 @@ export async function sendZoho(
   }
 
   const smtpHost = account.zohoProServers ? "smtppro.zoho.com" : "smtp.zoho.com";
+  // Port 587 (STARTTLS) often works better from cloud providers than 465 (SSL)
   const transporter = nodemailer.createTransport({
     host: smtpHost,
-    port: 465,
-    secure: true,
+    port: 587,
+    secure: false,
     auth: {
       user: account.email,
       pass: password,
     },
-    connectionTimeout: 30_000,
-    greetingTimeout: 15_000,
+    connectionTimeout: 60_000,
+    greetingTimeout: 20_000,
   });
 
   const mailOptions: nodemailer.SendMailOptions = {
@@ -39,6 +40,7 @@ export async function sendZoho(
   if (opts?.inReplyTo) mailOptions.inReplyTo = opts.inReplyTo;
   if (opts?.references) mailOptions.references = opts.references;
 
+  logger.info("Zoho SMTP send", { to, host: smtpHost, port: 587 });
   const info = await transporter.sendMail(mailOptions);
 
   const messageId = info.messageId ?? undefined;
